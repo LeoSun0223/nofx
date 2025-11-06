@@ -97,16 +97,31 @@ type AutoTrader struct {
 	lastResetTime         time.Time
 	stopUntil             time.Time
 	isRunning             bool
-	startTime             time.Time        // 系统启动时间
-	callCount             int              // AI调用次数
-	positionFirstSeenTime map[string]int64 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
-	stopMonitorCh         chan struct{}    // 用于停止监控goroutine
-	monitorWg             sync.WaitGroup   // 用于等待监控goroutine结束
-	peakPnLCache      map[string]float64 	 // 最高收益缓存 (symbol -> 峰值盈亏百分比)
-	peakPnLCacheMutex sync.RWMutex // 缓存读写锁
-	lastBalanceSyncTime   time.Time        // 上次余额同步时间
-	database              interface{}      // 数据库引用（用于自动更新余额）
-	userID                string           // 用户ID
+	startTime             time.Time                // 系统启动时间
+	callCount             int                      // AI调用次数
+	positionFirstSeenTime map[string]int64         // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+	stopMonitorCh         chan struct{}            // 用于停止监控goroutine
+	monitorWg             sync.WaitGroup           // 用于等待监控goroutine结束
+	peakPnLCache          map[string]float64       // 最高收益缓存 (symbol -> 峰值盈亏百分比)
+	peakPnLCacheMutex     sync.RWMutex             // 缓存读写锁
+	lastBalanceSyncTime   time.Time                // 上次余额同步时间
+	database              interface{}              // 数据库引用（用于自动更新余额）
+	userID                string                   // 用户ID
+	positionMeta          map[string]*positionMeta // 缓存 symbol_side 的入场详情，用于精确盈亏
+	stopLossCache         map[string]float64       // 缓存止损价，供“只收紧不放宽”校验
+	positionMetaMutex     sync.Mutex               // 保护 positionMeta/stopLossCache 的并发访问
+	consecutiveLosses     int                      // 连续亏损计数，驱动自动暂停
+}
+
+const (
+	minConfidence = 80   // 执行层硬性要求的最低置信度
+	floatEpsilon  = 1e-6 // 浮点比较容差
+)
+
+type positionMeta struct {
+	Side       string  // 持仓方向（long / short）
+	EntryPrice float64 // 入场参考价
+	Quantity   float64 // 成交数量
 }
 
 // NewAutoTrader 创建自动交易器
@@ -230,6 +245,9 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		monitorWg:             sync.WaitGroup{},
 		peakPnLCache:          make(map[string]float64),
 		peakPnLCacheMutex:     sync.RWMutex{},
+		positionMeta:          make(map[string]*positionMeta),
+		stopLossCache:         make(map[string]float64),
+		positionMetaMutex:     sync.Mutex{},
 		lastBalanceSyncTime:   time.Now(), // 初始化为当前时间
 		database:              database,
 		userID:                userID,
@@ -292,16 +310,20 @@ func (at *AutoTrader) autoSyncBalanceIfNeeded() {
 		return
 	}
 
-	// 提取可用余额
+	// 优先提取总钱包余额（不会受到保证金占用影响）
 	var actualBalance float64
-	if availableBalance, ok := balanceInfo["available_balance"].(float64); ok && availableBalance > 0 {
+	if walletBalance, ok := balanceInfo["totalWalletBalance"].(float64); ok && walletBalance > 0 {
+		actualBalance = walletBalance
+	} else if walletBalance, ok := balanceInfo["walletBalance"].(float64); ok && walletBalance > 0 {
+		actualBalance = walletBalance
+	} else if totalBalance, ok := balanceInfo["balance"].(float64); ok && totalBalance > 0 {
+		actualBalance = totalBalance
+	} else if availableBalance, ok := balanceInfo["available_balance"].(float64); ok && availableBalance > 0 {
 		actualBalance = availableBalance
 	} else if availableBalance, ok := balanceInfo["availableBalance"].(float64); ok && availableBalance > 0 {
 		actualBalance = availableBalance
-	} else if totalBalance, ok := balanceInfo["balance"].(float64); ok && totalBalance > 0 {
-		actualBalance = totalBalance
 	} else {
-		log.Printf("⚠️ [%s] 无法提取可用余额", at.name)
+		log.Printf("⚠️ [%s] 无法提取有效余额", at.name)
 		at.lastBalanceSyncTime = time.Now()
 		return
 	}
@@ -436,7 +458,7 @@ func (at *AutoTrader) runCycle() error {
 		})
 	}
 
-						log.Print(strings.Repeat("=", 70))
+	log.Print(strings.Repeat("=", 70))
 	for _, coin := range ctx.CandidateCoins {
 		record.CandidateCoins = append(record.CandidateCoins, coin.Symbol)
 	}
@@ -465,11 +487,11 @@ func (at *AutoTrader) runCycle() error {
 
 		// 打印系统提示词和AI思维链（即使有错误，也要输出以便调试）
 		if decision != nil {
-				log.Print("\n" + strings.Repeat("=", 70) + "\n")
-				log.Printf("📋 系统提示词 [模板: %s] (错误情况)", at.systemPromptTemplate)
-				log.Println(strings.Repeat("=", 70))
-				log.Println(decision.SystemPrompt)
-				log.Println(strings.Repeat("=", 70))
+			log.Print("\n" + strings.Repeat("=", 70) + "\n")
+			log.Printf("📋 系统提示词 [模板: %s] (错误情况)", at.systemPromptTemplate)
+			log.Println(strings.Repeat("=", 70))
+			log.Println(decision.SystemPrompt)
+			log.Println(strings.Repeat("=", 70))
 
 			if decision.CoTTrace != "" {
 				log.Print("\n" + strings.Repeat("-", 70) + "\n")
@@ -508,9 +530,9 @@ func (at *AutoTrader) runCycle() error {
 	//     }
 	// }
 	log.Println()
-				log.Print(strings.Repeat("-", 70))
+	log.Print(strings.Repeat("-", 70))
 	// 8. 对决策排序：确保先平仓后开仓（防止仓位叠加超限）
-				log.Print(strings.Repeat("-", 70))
+	log.Print(strings.Repeat("-", 70))
 
 	// 8. 对决策排序：确保先平仓后开仓（防止仓位叠加超限）
 	sortedDecisions := sortDecisionsByPriority(decision.Decisions)
@@ -738,6 +760,11 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, act
 func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📈 开多仓: %s", decision.Symbol)
 
+	if decision.Confidence < minConfidence {
+		// 开仓前硬限制置信度，避免低质量信号落地
+		return fmt.Errorf("置信度不足 (%d < %d)，拒绝开多仓", decision.Confidence, minConfidence)
+	}
+
 	// ⚠️ 关键：检查是否已有同币种同方向持仓，如果有则拒绝开仓（防止仓位叠加超限）
 	positions, err := at.trader.GetPositions()
 	if err == nil {
@@ -799,6 +826,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
 
+	// 缓存入场细节，供后续盈亏/止损逻辑使用
+	at.storePositionMeta(decision.Symbol, "long", marketData.CurrentPrice, quantity)
+
 	// 记录开仓时间
 	posKey := decision.Symbol + "_long"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
@@ -806,6 +836,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// 设置止损止盈
 	if err := at.trader.SetStopLoss(decision.Symbol, "LONG", quantity, decision.StopLoss); err != nil {
 		log.Printf("  ⚠ 设置止损失败: %v", err)
+	} else {
+		// 初次成功设置止损后同步更新缓存
+		at.storeStopLoss(decision.Symbol, "long", decision.StopLoss)
 	}
 	if err := at.trader.SetTakeProfit(decision.Symbol, "LONG", quantity, decision.TakeProfit); err != nil {
 		log.Printf("  ⚠ 设置止盈失败: %v", err)
@@ -817,6 +850,11 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 // executeOpenShortWithRecord 执行开空仓并记录详细信息
 func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📉 开空仓: %s", decision.Symbol)
+
+	if decision.Confidence < minConfidence {
+		// 置信度不达标的空单直接拦截
+		return fmt.Errorf("置信度不足 (%d < %d)，拒绝开空仓", decision.Confidence, minConfidence)
+	}
 
 	// ⚠️ 关键：检查是否已有同币种同方向持仓，如果有则拒绝开仓（防止仓位叠加超限）
 	positions, err := at.trader.GetPositions()
@@ -879,6 +917,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
 
+	// 保存空头入场信息，为后续止损/盈利统计做准备
+	at.storePositionMeta(decision.Symbol, "short", marketData.CurrentPrice, quantity)
+
 	// 记录开仓时间
 	posKey := decision.Symbol + "_short"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
@@ -886,6 +927,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// 设置止损止盈
 	if err := at.trader.SetStopLoss(decision.Symbol, "SHORT", quantity, decision.StopLoss); err != nil {
 		log.Printf("  ⚠ 设置止损失败: %v", err)
+	} else {
+		// 记录初始止损，确保之后只能向盈亏方向移动
+		at.storeStopLoss(decision.Symbol, "short", decision.StopLoss)
 	}
 	if err := at.trader.SetTakeProfit(decision.Symbol, "SHORT", quantity, decision.TakeProfit); err != nil {
 		log.Printf("  ⚠ 设置止盈失败: %v", err)
@@ -905,6 +949,12 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
+	// 尝试从缓存读取完整持仓数量（用于盈亏统计）
+	closedQty := at.getPositionQuantity(decision.Symbol, "long")
+	if closedQty > 0 {
+		actionRecord.Quantity = closedQty
+	}
+
 	// 平仓
 	order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = 全部平仓
 	if err != nil {
@@ -917,6 +967,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	log.Printf("  ✓ 平仓成功")
+	at.handleRealizedPnL(decision.Symbol, "long", closedQty, marketData.CurrentPrice)
 	return nil
 }
 
@@ -931,6 +982,12 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
+	// 空头同样读取缓存数量
+	closedQty := at.getPositionQuantity(decision.Symbol, "short")
+	if closedQty > 0 {
+		actionRecord.Quantity = closedQty
+	}
+
 	// 平仓
 	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = 全部平仓
 	if err != nil {
@@ -943,6 +1000,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	log.Printf("  ✓ 平仓成功")
+	at.handleRealizedPnL(decision.Symbol, "short", closedQty, marketData.CurrentPrice)
 	return nil
 }
 
@@ -991,6 +1049,10 @@ func (at *AutoTrader) executeUpdateStopLossWithRecord(decision *decision.Decisio
 		return fmt.Errorf("空单止损必须高于当前价格 (当前: %.2f, 新止损: %.2f)", marketData.CurrentPrice, decision.NewStopLoss)
 	}
 
+	if err := at.ensureStopLossTightening(decision.Symbol, positionSide, decision.NewStopLoss); err != nil {
+		return err
+	}
+
 	// 取消旧的止损单（避免多个止损单共存）
 	if err := at.trader.CancelStopOrders(decision.Symbol); err != nil {
 		log.Printf("  ⚠ 取消旧止损单失败: %v", err)
@@ -1003,6 +1065,8 @@ func (at *AutoTrader) executeUpdateStopLossWithRecord(decision *decision.Decisio
 	if err != nil {
 		return fmt.Errorf("修改止损失败: %w", err)
 	}
+
+	at.storeStopLoss(decision.Symbol, positionSide, decision.NewStopLoss)
 
 	log.Printf("  ✓ 止损已调整: %.2f (当前价格: %.2f)", decision.NewStopLoss, marketData.CurrentPrice)
 	return nil
@@ -1137,6 +1201,8 @@ func (at *AutoTrader) executePartialCloseWithRecord(decision *decision.Decision,
 	remainingQuantity := totalQuantity - closeQuantity
 	log.Printf("  ✓ 部分平仓成功: 平仓 %.4f (%.1f%%), 剩余 %.4f",
 		closeQuantity, decision.ClosePercentage, remainingQuantity)
+
+	at.handleRealizedPnL(decision.Symbol, strings.ToLower(positionSide), closeQuantity, marketData.CurrentPrice)
 
 	return nil
 }
@@ -1552,6 +1618,13 @@ func (at *AutoTrader) checkPositionDrawdown() {
 
 // 紧急平仓函数
 func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
+	normalizedSide := strings.ToLower(side)
+	closedQty := at.getPositionQuantity(symbol, normalizedSide)
+	closePrice := 0.0
+	if marketData, err := market.Get(symbol); err == nil {
+		closePrice = marketData.CurrentPrice
+	}
+
 	switch side {
 	case "long":
 		order, err := at.trader.CloseLong(symbol, 0) // 0 = 全部平仓
@@ -1567,6 +1640,10 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 		log.Printf("✅ 紧急平空仓成功，订单ID: %v", order["orderId"])
 	default:
 		return fmt.Errorf("未知的持仓方向: %s", side)
+	}
+
+	if closePrice > 0 && closedQty > 0 {
+		at.handleRealizedPnL(symbol, normalizedSide, closedQty, closePrice)
 	}
 
 	return nil
@@ -1607,4 +1684,133 @@ func (at *AutoTrader) ClearPeakPnLCache(symbol string) {
 	defer at.peakPnLCacheMutex.Unlock()
 
 	delete(at.peakPnLCache, symbol)
+}
+
+func (at *AutoTrader) positionKey(symbol, side string) string {
+	return fmt.Sprintf("%s_%s", symbol, strings.ToLower(side))
+}
+
+func (at *AutoTrader) storePositionMeta(symbol, side string, entryPrice, quantity float64) {
+	if quantity <= 0 {
+		return
+	}
+	key := at.positionKey(symbol, side)
+	at.positionMetaMutex.Lock()
+	defer at.positionMetaMutex.Unlock()
+	at.positionMeta[key] = &positionMeta{
+		Side:       strings.ToLower(side),
+		EntryPrice: entryPrice,
+		Quantity:   quantity,
+	}
+}
+
+func (at *AutoTrader) getPositionQuantity(symbol, side string) float64 {
+	key := at.positionKey(symbol, side)
+	at.positionMetaMutex.Lock()
+	defer at.positionMetaMutex.Unlock()
+	if meta, ok := at.positionMeta[key]; ok {
+		return meta.Quantity
+	}
+	return 0
+}
+
+func (at *AutoTrader) storeStopLoss(symbol, side string, stopLoss float64) {
+	key := at.positionKey(symbol, side)
+	at.positionMetaMutex.Lock()
+	defer at.positionMetaMutex.Unlock()
+	at.stopLossCache[key] = stopLoss
+}
+
+func (at *AutoTrader) ensureStopLossTightening(symbol, side string, newStop float64) error {
+	key := at.positionKey(symbol, side)
+	at.positionMetaMutex.Lock()
+	defer at.positionMetaMutex.Unlock()
+
+	// 若无历史记录说明首次设置，直接放行
+	previous, exists := at.stopLossCache[key]
+	if !exists {
+		return nil
+	}
+
+	if strings.ToUpper(side) == "LONG" {
+		if newStop+floatEpsilon < previous {
+			return fmt.Errorf("止损只能收紧，现有止损 %.4f，新止损 %.4f", previous, newStop)
+		}
+	} else {
+		if newStop-floatEpsilon > previous {
+			return fmt.Errorf("止损只能收紧，现有止损 %.4f，新止损 %.4f", previous, newStop)
+		}
+	}
+	return nil
+}
+
+func (at *AutoTrader) handleRealizedPnL(symbol, side string, closedQuantity, closePrice float64) {
+	if closedQuantity <= 0 {
+		return
+	}
+
+	key := at.positionKey(symbol, side)
+	at.positionMetaMutex.Lock()
+	meta, exists := at.positionMeta[key]
+	if !exists {
+		at.positionMetaMutex.Unlock()
+		return
+	}
+
+	entryPrice := meta.EntryPrice
+	remaining := meta.Quantity - closedQuantity
+	if remaining < floatEpsilon {
+		delete(at.positionMeta, key)
+		delete(at.stopLossCache, key)
+	} else {
+		meta.Quantity = remaining
+		at.positionMeta[key] = meta
+	}
+	at.positionMetaMutex.Unlock()
+
+	var pnl float64
+	if strings.ToLower(side) == "long" {
+		pnl = (closePrice - entryPrice) * closedQuantity
+	} else {
+		pnl = (entryPrice - closePrice) * closedQuantity
+	}
+
+	at.updateConsecutiveLosses(pnl)
+}
+
+func (at *AutoTrader) updateConsecutiveLosses(pnl float64) {
+	if math.Abs(pnl) < floatEpsilon {
+		return
+	}
+
+	if pnl < 0 {
+		at.consecutiveLosses++
+		var pauseDuration time.Duration
+		switch at.consecutiveLosses {
+		case 2:
+			// 连续2笔亏损 → 暂停 45 分钟
+			pauseDuration = 45 * time.Minute
+		case 3:
+			// 连续3笔亏损 → 暂停 24 小时
+			pauseDuration = 24 * time.Hour
+		default:
+			if at.consecutiveLosses >= 4 {
+				// 4笔及以上 → 暂停 72 小时，等待人工干预
+				pauseDuration = 72 * time.Hour
+			}
+		}
+
+		if pauseDuration > 0 {
+			at.stopUntil = time.Now().Add(pauseDuration)
+			log.Printf("🚫 连续亏损 %d 笔，暂停交易 %v，恢复时间 %s", at.consecutiveLosses, pauseDuration, at.stopUntil.Format("2006-01-02 15:04"))
+		} else {
+			log.Printf("⚠️ 连续亏损 %d 笔，请提高信号质量", at.consecutiveLosses)
+		}
+	} else {
+		if at.consecutiveLosses > 0 {
+			// 盈利后立即清零连续亏损计数
+			log.Printf("✅ 本笔盈利 %.4f，连续亏损计数重置", pnl)
+		}
+		at.consecutiveLosses = 0
+	}
 }
