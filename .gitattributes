@@ -1,0 +1,30 @@
+# 让 Git 自动处理换行符
+* text=auto
+
+# 代码文件统一使用 LF（Linux 风格）
+*.go       text eol=lf
+*.js       text eol=lf
+*.ts       text eol=lf
+*.tsx      text eol=lf
+*.jsx      text eol=lf
+*.json     text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.sh       text eol=lf
+*.md       text eol=lf
+*.txt      text eol=lf
+
+# Windows 脚本文件保留 CRLF
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+
+# 二进制文件不要改动行尾
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.pdf      binary
+*.zip      binary
+*.exe      binary
+*.dll      binary
