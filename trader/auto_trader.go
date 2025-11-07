@@ -109,6 +109,7 @@ type AutoTrader struct {
 	userID                string                   // 用户ID
 	positionMeta          map[string]*positionMeta // 缓存 symbol_side 的入场详情，用于精确盈亏
 	stopLossCache         map[string]float64       // 缓存止损价，供“只收紧不放宽”校验
+	takeProfitCache       map[string]float64       // 缓存止盈价，便于动态调整
 	positionMetaMutex     sync.Mutex               // 保护 positionMeta/stopLossCache 的并发访问
 	consecutiveLosses     int                      // 连续亏损计数，驱动自动暂停
 }
@@ -247,6 +248,7 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		peakPnLCacheMutex:     sync.RWMutex{},
 		positionMeta:          make(map[string]*positionMeta),
 		stopLossCache:         make(map[string]float64),
+		takeProfitCache:       make(map[string]float64),
 		positionMetaMutex:     sync.Mutex{},
 		lastBalanceSyncTime:   time.Now(), // 初始化为当前时间
 		database:              database,
@@ -531,10 +533,18 @@ func (at *AutoTrader) runCycle() error {
 	// }
 	log.Println()
 	log.Print(strings.Repeat("-", 70))
-	// 8. 对决策排序：确保先平仓后开仓（防止仓位叠加超限）
-	log.Print(strings.Repeat("-", 70))
+	// 8. 自动补充动态止盈指令（若AI未覆盖且浮盈达到阈值）
+	autoTPDecisions := at.buildAutoTakeProfitDecisions(ctx, decision.Decisions)
+	if len(autoTPDecisions) > 0 {
+		log.Printf("⚙️ 自动补充 %d 个动态止盈指令，确保盈利单同步调整目标", len(autoTPDecisions))
+		decision.Decisions = append(decision.Decisions, autoTPDecisions...)
+		if marshaled, err := json.MarshalIndent(decision.Decisions, "", "  "); err == nil {
+			record.DecisionJSON = string(marshaled)
+		}
+	}
 
-	// 8. 对决策排序：确保先平仓后开仓（防止仓位叠加超限）
+	// 9. 对决策排序：确保先平仓后开仓（防止仓位叠加超限）
+	log.Print(strings.Repeat("-", 70))
 	sortedDecisions := sortDecisionsByPriority(decision.Decisions)
 
 	log.Println("🔄 执行顺序（已优化）: 先平仓→后开仓")
@@ -756,6 +766,41 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, act
 	}
 }
 
+func ensureMidTermEntryFilters(data *market.Data, direction string) error {
+	if data == nil || data.MidTermContext == nil {
+		return fmt.Errorf("缺少15m指标，无法验证%s条件", direction)
+	}
+
+	mt := data.MidTermContext
+	if mt.ATR14 <= 0 || mt.EMA20 == 0 || mt.RSI7 <= 0 {
+		return fmt.Errorf("15m指标尚未就绪，拒绝%s", direction)
+	}
+
+	price := data.CurrentPrice
+	switch direction {
+	case "long":
+		upper := mt.EMA20 + 0.6*mt.ATR14
+		if mt.RSI7 > 72 {
+			return fmt.Errorf("15m RSI(7)=%.2f 超出72，提示词要求 wait", mt.RSI7)
+		}
+		if price > upper {
+			return fmt.Errorf("价格 %.2f 高于 15m EMA20+0.6ATR(%.2f)，拒绝追多", price, upper)
+		}
+	case "short":
+		lower := mt.EMA20 - 0.6*mt.ATR14
+		if mt.RSI7 < 28 {
+			return fmt.Errorf("15m RSI(7)=%.2f 低于28，提示词要求 wait", mt.RSI7)
+		}
+		if price < lower {
+			return fmt.Errorf("价格 %.2f 低于 15m EMA20-0.6ATR(%.2f)，拒绝追空", price, lower)
+		}
+	default:
+		return fmt.Errorf("未知方向: %s", direction)
+	}
+
+	return nil
+}
+
 // executeOpenLongWithRecord 执行开多仓并记录详细信息
 func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📈 开多仓: %s", decision.Symbol)
@@ -778,6 +823,12 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// 获取当前价格
 	marketData, err := market.Get(decision.Symbol)
 	if err != nil {
+		return err
+	}
+	if err := ensureMidTermEntryFilters(marketData, "short"); err != nil {
+		return err
+	}
+	if err := ensureMidTermEntryFilters(marketData, "long"); err != nil {
 		return err
 	}
 
@@ -842,6 +893,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 	if err := at.trader.SetTakeProfit(decision.Symbol, "LONG", quantity, decision.TakeProfit); err != nil {
 		log.Printf("  ⚠ 设置止盈失败: %v", err)
+	} else {
+		at.storeTakeProfit(decision.Symbol, "long", decision.TakeProfit)
 	}
 
 	return nil
@@ -933,6 +986,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 	if err := at.trader.SetTakeProfit(decision.Symbol, "SHORT", quantity, decision.TakeProfit); err != nil {
 		log.Printf("  ⚠ 设置止盈失败: %v", err)
+	} else {
+		at.storeTakeProfit(decision.Symbol, "short", decision.TakeProfit)
 	}
 
 	return nil
@@ -1129,6 +1184,8 @@ func (at *AutoTrader) executeUpdateTakeProfitWithRecord(decision *decision.Decis
 	if err != nil {
 		return fmt.Errorf("修改止盈失败: %w", err)
 	}
+
+	at.storeTakeProfit(decision.Symbol, positionSide, decision.NewTakeProfit)
 
 	log.Printf("  ✓ 止盈已调整: %.2f (当前价格: %.2f)", decision.NewTakeProfit, marketData.CurrentPrice)
 	return nil
@@ -1449,6 +1506,121 @@ func sortDecisionsByPriority(decisions []decision.Decision) []decision.Decision 
 	return sorted
 }
 
+func findPositionSide(positions []decision.PositionInfo, symbol string) string {
+	for _, pos := range positions {
+		if strings.EqualFold(pos.Symbol, symbol) && pos.Quantity > 0 {
+			return strings.ToLower(pos.Side)
+		}
+	}
+	return ""
+}
+
+func (at *AutoTrader) buildAutoTakeProfitDecisions(ctx *decision.Context, base []decision.Decision) []decision.Decision {
+	if ctx == nil {
+		return nil
+	}
+
+	existing := make(map[string]bool)
+	for _, d := range base {
+		if d.Action != "update_take_profit" {
+			continue
+		}
+		side := findPositionSide(ctx.Positions, d.Symbol)
+		if side == "" {
+			side = "long"
+		}
+		key := strings.ToUpper(d.Symbol) + "_" + side
+		existing[key] = true
+	}
+
+	var autoDecisions []decision.Decision
+	for _, pos := range ctx.Positions {
+		side := strings.ToLower(pos.Side)
+		key := strings.ToUpper(pos.Symbol) + "_" + side
+		if existing[key] {
+			continue
+		}
+
+		stop, ok := at.getStopLoss(pos.Symbol, side)
+		if !ok {
+			continue
+		}
+
+		entry := pos.EntryPrice
+		var risk float64
+		if side == "long" {
+			risk = entry - stop
+		} else {
+			risk = stop - entry
+		}
+		if risk <= floatEpsilon {
+			continue
+		}
+
+		currentPrice := pos.MarkPrice
+		if ctx.MarketDataMap != nil {
+			if data, ok := ctx.MarketDataMap[pos.Symbol]; ok && data.CurrentPrice > 0 {
+				currentPrice = data.CurrentPrice
+			}
+		}
+
+		var favorable float64
+		if side == "long" {
+			favorable = currentPrice - entry
+		} else {
+			favorable = entry - currentPrice
+		}
+		if favorable <= risk {
+			continue
+		}
+
+		rMultiple := favorable / risk
+		var targetMultiple float64
+		switch {
+		case rMultiple >= 3.0:
+			targetMultiple = rMultiple + 0.5
+		case rMultiple >= 2.0:
+			targetMultiple = 3.5
+		case rMultiple >= 1.5:
+			targetMultiple = 2.5
+		default:
+			continue
+		}
+
+		var desiredTP float64
+		if side == "long" {
+			desiredTP = entry + targetMultiple*risk
+			if desiredTP <= currentPrice {
+				desiredTP = currentPrice + 0.3*risk
+			}
+		} else {
+			desiredTP = entry - targetMultiple*risk
+			if desiredTP >= currentPrice {
+				desiredTP = currentPrice - 0.3*risk
+			}
+		}
+
+		if tp, ok := at.getTakeProfit(pos.Symbol, side); ok {
+			if side == "long" && desiredTP <= tp*(1+1e-5) {
+				continue
+			}
+			if side == "short" && desiredTP >= tp*(1-1e-5) {
+				continue
+			}
+		}
+
+		autoDecisions = append(autoDecisions, decision.Decision{
+			Symbol:        pos.Symbol,
+			Action:        "update_take_profit",
+			NewTakeProfit: desiredTP,
+			Reasoning:     fmt.Sprintf("[auto_tp] 浮盈%.2fR，自动上调止盈追踪趋势", rMultiple),
+		})
+		existing[key] = true
+	}
+
+	return autoDecisions
+}
+
 // getCandidateCoins 获取交易员的候选币种列表
 func (at *AutoTrader) getCandidateCoins() ([]decision.CandidateCoin, error) {
 	if len(at.tradingCoins) == 0 {
@@ -1721,6 +1893,29 @@ func (at *AutoTrader) storeStopLoss(symbol, side string, stopLoss float64) {
 	at.stopLossCache[key] = stopLoss
 }
 
+func (at *AutoTrader) getStopLoss(symbol, side string) (float64, bool) {
+	key := at.positionKey(symbol, side)
+	at.positionMetaMutex.Lock()
+	defer at.positionMetaMutex.Unlock()
+	value, ok := at.stopLossCache[key]
+	return value, ok
+}
+
+func (at *AutoTrader) storeTakeProfit(symbol, side string, takeProfit float64) {
+	key := at.positionKey(symbol, side)
+	at.positionMetaMutex.Lock()
+	defer at.positionMetaMutex.Unlock()
+	at.takeProfitCache[key] = takeProfit
+}
+
+func (at *AutoTrader) getTakeProfit(symbol, side string) (float64, bool) {
+	key := at.positionKey(symbol, side)
+	at.positionMetaMutex.Lock()
+	defer at.positionMetaMutex.Unlock()
+	value, ok := at.takeProfitCache[key]
+	return value, ok
+}
+
 func (at *AutoTrader) ensureStopLossTightening(symbol, side string, newStop float64) error {
 	key := at.positionKey(symbol, side)
 	at.positionMetaMutex.Lock()
@@ -1762,6 +1957,7 @@ func (at *AutoTrader) handleRealizedPnL(symbol, side string, closedQuantity, clo
 	if remaining < floatEpsilon {
 		delete(at.positionMeta, key)
 		delete(at.stopLossCache, key)
+		delete(at.takeProfitCache, key)
 	} else {
 		meta.Quantity = remaining
 		at.positionMeta[key] = meta

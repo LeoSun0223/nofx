@@ -11,6 +11,7 @@ type Data struct {
 	CurrentEMA20      float64
 	CurrentMACD       float64
 	CurrentRSI7       float64
+	MidTermContext    *MidTermData
 	OpenInterest      *OIData
 	FundingRate       float64
 	IntradaySeries    *IntradayData
@@ -30,6 +31,15 @@ type IntradayData struct {
 	MACDValues  []float64
 	RSI7Values  []float64
 	RSI14Values []float64
+}
+
+// MidTermData 15m周期的中期数据
+type MidTermData struct {
+	EMA20 float64
+	EMA50 float64
+	ATR14 float64
+	RSI7  float64
+	RSI14 float64
 }
 
 // LongerTermData 长期数据(4小时时间框架)

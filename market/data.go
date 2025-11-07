@@ -12,7 +12,7 @@ import (
 
 // Get 获取指定代币的市场数据
 func Get(symbol string) (*Data, error) {
-	var klines3m, klines4h []Kline
+	var klines3m, klines4h, klines15m []Kline
 	var err error
 	// 标准化symbol
 	symbol = Normalize(symbol)
@@ -20,6 +20,12 @@ func Get(symbol string) (*Data, error) {
 	klines3m, err = WSMonitorCli.GetCurrentKlines(symbol, "3m") // 多获取一些用于计算
 	if err != nil {
 		return nil, fmt.Errorf("获取3分钟K线失败: %v", err)
+	}
+
+	// 获取15分钟数据（用于中周期约束）
+	klines15m, err = WSMonitorCli.GetCurrentKlines(symbol, "15m")
+	if err != nil {
+		return nil, fmt.Errorf("获取15分钟K线失败: %v", err)
 	}
 
 	// 获取4小时K线数据 (最近10个)
@@ -66,7 +72,8 @@ func Get(symbol string) (*Data, error) {
 	// 计算日内系列数据
 	intradayData := calculateIntradaySeries(klines3m)
 
-	// 计算长期数据
+	// 计算中期与长期数据
+	midTermData := calculateMidTermData(klines15m)
 	longerTermData := calculateLongerTermData(klines4h)
 
 	return &Data{
@@ -77,6 +84,7 @@ func Get(symbol string) (*Data, error) {
 		CurrentEMA20:      currentEMA20,
 		CurrentMACD:       currentMACD,
 		CurrentRSI7:       currentRSI7,
+		MidTermContext:    midTermData,
 		OpenInterest:      oiData,
 		FundingRate:       fundingRate,
 		IntradaySeries:    intradayData,
@@ -241,6 +249,22 @@ func calculateIntradaySeries(klines []Kline) *IntradayData {
 	}
 
 	return data
+}
+
+// calculateMidTermData 计算15m周期的关键指标
+func calculateMidTermData(klines []Kline) *MidTermData {
+	// 至少需要50根K线才能计算EMA50并确保指标稳定
+	if len(klines) < 50 {
+		return nil
+	}
+
+	return &MidTermData{
+		EMA20: calculateEMA(klines, 20),
+		EMA50: calculateEMA(klines, 50),
+		ATR14: calculateATR(klines, 14),
+		RSI7:  calculateRSI(klines, 7),
+		RSI14: calculateRSI(klines, 14),
+	}
 }
 
 // calculateLongerTermData 计算长期数据
