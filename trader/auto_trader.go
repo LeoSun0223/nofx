@@ -538,6 +538,15 @@ func (at *AutoTrader) runCycle() error {
 	if len(autoTPDecisions) > 0 {
 		log.Printf("⚙️ 自动补充 %d 个动态止盈指令，确保盈利单同步调整目标", len(autoTPDecisions))
 		decision.Decisions = append(decision.Decisions, autoTPDecisions...)
+	}
+
+	autoSLDecisions := at.buildAutoStopLossDecisions(ctx, decision.Decisions)
+	if len(autoSLDecisions) > 0 {
+		log.Printf("⚠️ 结构/动能失效，自动追加 %d 条收紧止损指令", len(autoSLDecisions))
+		decision.Decisions = append(decision.Decisions, autoSLDecisions...)
+	}
+
+	if len(autoTPDecisions) > 0 || len(autoSLDecisions) > 0 {
 		if marshaled, err := json.MarshalIndent(decision.Decisions, "", "  "); err == nil {
 			record.DecisionJSON = string(marshaled)
 		}
@@ -801,6 +810,52 @@ func ensureMidTermEntryFilters(data *market.Data, direction string) error {
 	return nil
 }
 
+func isMajorPair(symbol string) bool {
+	s := strings.ToUpper(symbol)
+	return s == "BTCUSDT" || s == "ETHUSDT"
+}
+
+func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, availableBalance float64) error {
+	if decision.Leverage <= 0 {
+		return fmt.Errorf("杠杆未设置，无法计算保证金")
+	}
+
+	// 预留 0.5U 或 2% 余额作为手续费缓冲
+	safetyBuffer := math.Max(0.5, availableBalance*0.02)
+	maxUsable := availableBalance - safetyBuffer
+	if maxUsable <= 0 {
+		return fmt.Errorf("可用余额 %.2f USDT 不足以覆盖手续费缓冲", availableBalance)
+	}
+
+	maxNotional := maxUsable * float64(decision.Leverage)
+	minNotional := 12.0
+	if isMajorPair(decision.Symbol) {
+		minNotional = 60.0
+	}
+
+	if maxNotional < minNotional {
+		return fmt.Errorf("可用余额仅支撑 %.2f USDT 名义价值，低于最小下单要求 %.2f USDT", maxNotional, minNotional)
+	}
+
+	maxRisk := availableBalance * 0.8
+
+	if decision.PositionSizeUSD > maxNotional {
+		ratio := maxNotional / decision.PositionSizeUSD
+		log.Printf("  ⚖️ 自动下调 %s 仓位: %.2f → %.2f USDT (余额%.2f)", decision.Symbol, decision.PositionSizeUSD, maxNotional, availableBalance)
+		decision.PositionSizeUSD = maxNotional
+		if decision.RiskUSD > 0 {
+			decision.RiskUSD *= ratio
+		}
+	}
+
+	if decision.RiskUSD > 0 && decision.RiskUSD > maxRisk {
+		log.Printf("  ⚠️ 风险预算 %.2f USDT 超过余额 80%% (%.2f)，自动降至 %.2f", decision.RiskUSD, maxRisk, maxRisk)
+		decision.RiskUSD = maxRisk
+	}
+
+	return nil
+}
+
 // executeOpenLongWithRecord 执行开多仓并记录详细信息
 func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📈 开多仓: %s", decision.Symbol)
@@ -838,8 +893,6 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	actionRecord.Price = marketData.CurrentPrice
 
 	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
-	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
-
 	balance, err := at.trader.GetBalance()
 	if err != nil {
 		return fmt.Errorf("获取账户余额失败: %w", err)
@@ -849,6 +902,11 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		availableBalance = avail
 	}
 
+	if err := at.ensurePositionFitsBalance(decision, availableBalance); err != nil {
+		return err
+	}
+
+	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
 	// 手续费估算（Taker费率 0.04%）
 	estimatedFee := decision.PositionSizeUSD * 0.0004
 	totalRequired := requiredMargin + estimatedFee
@@ -931,8 +989,6 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	actionRecord.Price = marketData.CurrentPrice
 
 	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
-	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
-
 	balance, err := at.trader.GetBalance()
 	if err != nil {
 		return fmt.Errorf("获取账户余额失败: %w", err)
@@ -942,6 +998,11 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		availableBalance = avail
 	}
 
+	if err := at.ensurePositionFitsBalance(decision, availableBalance); err != nil {
+		return err
+	}
+
+	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
 	// 手续费估算（Taker费率 0.04%）
 	estimatedFee := decision.PositionSizeUSD * 0.0004
 	totalRequired := requiredMargin + estimatedFee
@@ -1619,6 +1680,113 @@ func (at *AutoTrader) buildAutoTakeProfitDecisions(ctx *decision.Context, base [
 	}
 
 	return autoDecisions
+}
+
+func (at *AutoTrader) buildAutoStopLossDecisions(ctx *decision.Context, base []decision.Decision) []decision.Decision {
+	if ctx == nil || len(ctx.Positions) == 0 {
+		return nil
+	}
+
+	existing := make(map[string]bool)
+	for _, d := range base {
+		if d.Action == "update_stop_loss" {
+			key := strings.ToUpper(d.Symbol)
+			existing[key] = true
+		}
+	}
+
+	var out []decision.Decision
+	for _, pos := range ctx.Positions {
+		side := strings.ToLower(pos.Side)
+		key := strings.ToUpper(pos.Symbol)
+		if existing[key] {
+			continue
+		}
+
+		entry := pos.EntryPrice
+		current := pos.MarkPrice
+		if ctx.MarketDataMap != nil {
+			if data, ok := ctx.MarketDataMap[pos.Symbol]; ok && data != nil && data.CurrentPrice > 0 {
+				current = data.CurrentPrice
+			}
+		}
+
+		stop, ok := at.getStopLoss(pos.Symbol, side)
+		if !ok || stop == 0 {
+			continue
+		}
+
+		var risk, adverse float64
+		if side == "long" {
+			risk = entry - stop
+			adverse = entry - current
+		} else {
+			risk = stop - entry
+			adverse = current - entry
+		}
+
+		if risk <= floatEpsilon {
+			continue
+		}
+
+		var rsi float64
+		if ctx.MarketDataMap != nil {
+			if data, ok := ctx.MarketDataMap[pos.Symbol]; ok && data != nil && data.MidTermContext != nil {
+				rsi = data.MidTermContext.RSI7
+			}
+		}
+
+		trigger := false
+		if side == "short" {
+			if current > entry || adverse >= 0.4*risk || rsi >= 55 {
+				trigger = true
+			}
+		} else {
+			if current < entry || adverse >= 0.4*risk || (rsi > 0 && rsi <= 45) {
+				trigger = true
+			}
+		}
+
+		if !trigger {
+			continue
+		}
+
+		var newStop float64
+		buffer := math.Max(current*0.0008, risk*0.15)
+		if side == "short" {
+			newStop = current + buffer
+			if newStop >= stop {
+				newStop = stop - buffer*0.5
+			}
+			if newStop <= current {
+				newStop = current + buffer
+			}
+			if newStop >= stop-floatEpsilon {
+				continue
+			}
+		} else {
+			newStop = current - buffer
+			if newStop <= stop {
+				newStop = stop + buffer*0.5
+			}
+			if newStop >= current {
+				newStop = current - buffer
+			}
+			if newStop <= stop+floatEpsilon {
+				continue
+			}
+		}
+
+		out = append(out, decision.Decision{
+			Symbol:      pos.Symbol,
+			Action:      "update_stop_loss",
+			NewStopLoss: newStop,
+			Reasoning:   "结构/动能失效，自动收紧止损保护本金",
+		})
+		existing[key] = true
+	}
+
+	return out
 }
 
 // getCandidateCoins 获取交易员的候选币种列表
