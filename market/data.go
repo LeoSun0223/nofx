@@ -38,7 +38,11 @@ func Get(symbol string) (*Data, error) {
 	currentPrice := klines3m[len(klines3m)-1].Close
 	currentEMA20 := calculateEMA(klines3m, 20)
 	currentMACD := calculateMACD(klines3m)
-	currentRSI7 := calculateRSI(klines3m, 7)
+	currentRSI7 := calculateRSI(klines15m, 7)
+	if currentRSI7 == 0 {
+		// 如果15m数据不足，退回到3m，避免缺失
+		currentRSI7 = calculateRSI(klines3m, 7)
+	}
 
 	// 计算价格变化百分比
 	// 1小时价格变化 = 20个3分钟K线前的价格
