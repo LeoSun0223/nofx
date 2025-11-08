@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -684,12 +685,14 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 		return err
 	}
 
+	roundedPrice, priceStr := t.FormatPrice(symbol, stopPrice)
+
 	_, err = t.client.NewCreateOrderService().
 		Symbol(symbol).
 		Side(side).
 		PositionSide(posSide).
 		Type(futures.OrderTypeStopMarket).
-		StopPrice(fmt.Sprintf("%.8f", stopPrice)).
+		StopPrice(priceStr).
 		Quantity(quantityStr).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
@@ -699,7 +702,7 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 		return fmt.Errorf("设置止损失败: %w", err)
 	}
 
-	log.Printf("  止损价设置: %.4f", stopPrice)
+	log.Printf("  止损价设置: %.4f -> %.4f", stopPrice, roundedPrice)
 	return nil
 }
 
@@ -722,12 +725,14 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 		return err
 	}
 
+	roundedPrice, priceStr := t.FormatPrice(symbol, takeProfitPrice)
+
 	_, err = t.client.NewCreateOrderService().
 		Symbol(symbol).
 		Side(side).
 		PositionSide(posSide).
 		Type(futures.OrderTypeTakeProfitMarket).
-		StopPrice(fmt.Sprintf("%.8f", takeProfitPrice)).
+		StopPrice(priceStr).
 		Quantity(quantityStr).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
@@ -737,7 +742,7 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 		return fmt.Errorf("设置止盈失败: %w", err)
 	}
 
-	log.Printf("  止盈价设置: %.4f", takeProfitPrice)
+	log.Printf("  止盈价设置: %.4f -> %.4f", takeProfitPrice, roundedPrice)
 	return nil
 }
 
@@ -845,6 +850,46 @@ func (t *FuturesTrader) FormatQuantity(symbol string, quantity float64) (string,
 
 	format := fmt.Sprintf("%%.%df", precision)
 	return fmt.Sprintf(format, quantity), nil
+}
+
+// getPriceTickSize 获取交易对的最小价格步长及精度
+func (t *FuturesTrader) getPriceTickSize(symbol string) (tickSize float64, precision int, err error) {
+	exchangeInfo, err := t.client.NewExchangeInfoService().Do(context.Background())
+	if err != nil {
+		return 0, 0, fmt.Errorf("获取价格精度失败: %w", err)
+	}
+
+	for _, s := range exchangeInfo.Symbols {
+		if s.Symbol != symbol {
+			continue
+		}
+		for _, filter := range s.Filters {
+			if filter["filterType"] == "PRICE_FILTER" {
+				if tickSizeStr, ok := filter["tickSize"].(string); ok {
+					tickSize, _ = strconv.ParseFloat(tickSizeStr, 64)
+					precision = calculatePrecision(tickSizeStr)
+					return tickSize, precision, nil
+				}
+			}
+		}
+	}
+	return 0, 8, fmt.Errorf("未找到 %s 的价格精度信息", symbol)
+}
+
+// FormatPrice 将价格对齐到正确的 tick size 并格式化
+func (t *FuturesTrader) FormatPrice(symbol string, price float64) (float64, string) {
+	tickSize, precision, err := t.getPriceTickSize(symbol)
+	if err != nil {
+		log.Printf("  ⚠️ 获取 %s 价格精度失败: %v，使用默认格式", symbol, err)
+		return price, fmt.Sprintf("%.8f", price)
+	}
+
+	rounded := roundToTickSize(price, tickSize)
+	if precision <= 0 && tickSize > 0 {
+		precision = int(math.Max(0, math.Round(-math.Log10(tickSize))))
+	}
+	format := fmt.Sprintf("%%.%df", precision)
+	return rounded, fmt.Sprintf(format, rounded)
 }
 
 // 辅助函数
