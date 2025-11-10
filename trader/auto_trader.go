@@ -789,7 +789,7 @@ func ensureMidTermEntryFilters(data *market.Data, direction string) error {
 	switch direction {
 	case "long":
 		upper := mt.EMA20 + 0.6*mt.ATR14
-		if mt.RSI7 > 72 {
+		if mt.RSI7 > 68 {
 			return fmt.Errorf("15m RSI(7)=%.2f 超出72，提示词要求 wait", mt.RSI7)
 		}
 		if price > upper {
@@ -797,7 +797,7 @@ func ensureMidTermEntryFilters(data *market.Data, direction string) error {
 		}
 	case "short":
 		lower := mt.EMA20 - 0.6*mt.ATR14
-		if mt.RSI7 < 28 {
+		if mt.RSI7 < 32 {
 			return fmt.Errorf("15m RSI(7)=%.2f 低于28，提示词要求 wait", mt.RSI7)
 		}
 		if price < lower {
