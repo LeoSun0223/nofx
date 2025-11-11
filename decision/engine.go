@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
@@ -678,13 +679,20 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		const minPositionSizeGeneral = 12.0 // 10 + 20% 安全边际
 		const minPositionSizeBTCETH = 60.0  // BTC/ETH 因价格高和精度限制需要更大金额（更灵活）
 
+		minRequired := minPositionSizeGeneral
 		if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
-			if d.PositionSizeUSD < minPositionSizeBTCETH {
-				return fmt.Errorf("%s 开仓金额过小(%.2f USDT)，必须≥%.2f USDT（因价格高且精度限制，避免数量四舍五入为0）", d.Symbol, d.PositionSizeUSD, minPositionSizeBTCETH)
-			}
-		} else {
-			if d.PositionSizeUSD < minPositionSizeGeneral {
-				return fmt.Errorf("开仓金额过小(%.2f USDT)，必须≥%.2f USDT（Binance 最小名义价值要求）", d.PositionSizeUSD, minPositionSizeGeneral)
+			minRequired = minPositionSizeBTCETH
+		}
+		if d.PositionSizeUSD < minRequired {
+			if d.PositionSizeUSD <= 0 {
+				d.PositionSizeUSD = minRequired
+			} else {
+				ratio := minRequired / d.PositionSizeUSD
+				log.Printf("⚖️ 调整 %s 最小名义: %.2f → %.2f USDT（满足交易所最小要求）", d.Symbol, d.PositionSizeUSD, minRequired)
+				d.PositionSizeUSD = minRequired
+				if d.RiskUSD > 0 {
+					d.RiskUSD *= ratio
+				}
 			}
 		}
 
@@ -742,6 +750,20 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		if riskRewardRatio < 3.0 {
 			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥3.0:1 [风险:%.2f%% 收益:%.2f%%] [止损:%.2f 止盈:%.2f]",
 				riskRewardRatio, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
+		}
+
+		// 校准 risk_usd（执行层按照净值的0.5%）
+		if accountEquity > 0 {
+			expectedRisk := math.Max(accountEquity*0.005, 0.5)
+			if d.RiskUSD <= 0 {
+				d.RiskUSD = expectedRisk
+			} else {
+				diff := math.Abs(d.RiskUSD - expectedRisk)
+				if diff > expectedRisk*0.5 {
+					log.Printf("⚠️ 调整 %s 风险预算: %.2f → %.2f（依据净值 %.2f）", d.Symbol, d.RiskUSD, expectedRisk, accountEquity)
+					d.RiskUSD = expectedRisk
+				}
+			}
 		}
 	}
 

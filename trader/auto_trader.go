@@ -815,7 +815,7 @@ func isMajorPair(symbol string) bool {
 	return s == "BTCUSDT" || s == "ETHUSDT"
 }
 
-func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, availableBalance float64) error {
+func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, availableBalance, totalEquity float64, marketData *market.Data) error {
 	if decision.Leverage <= 0 {
 		return fmt.Errorf("杠杆未设置，无法计算保证金")
 	}
@@ -839,6 +839,28 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 
 	maxRisk := availableBalance * 0.8
 
+	// 小账户模式：净值低于 150U 时收紧所有关键约束，防止 AI 过度下单
+	if totalEquity > floatEpsilon && totalEquity < 150 {
+		maxNotionalByEquity := totalEquity
+		if decision.PositionSizeUSD > maxNotionalByEquity {
+			ratio := maxNotionalByEquity / decision.PositionSizeUSD
+			log.Printf("  🛡 小账户模式限制 %s 仓位: %.2f → %.2f USDT (净值%.2f)", decision.Symbol, decision.PositionSizeUSD, maxNotionalByEquity, totalEquity)
+			decision.PositionSizeUSD = maxNotionalByEquity
+			if decision.RiskUSD > 0 {
+				decision.RiskUSD *= ratio
+			}
+		}
+
+		if marketData == nil || marketData.MidTermContext == nil || marketData.MidTermContext.ATR14 <= 0 {
+			return fmt.Errorf("小账户模式需要ATR数据，当前无法验证止损距离")
+		}
+		distance := math.Abs(decision.StopLoss - marketData.CurrentPrice)
+		maxDistance := marketData.MidTermContext.ATR14
+		if distance > maxDistance {
+			return fmt.Errorf("小账户模式要求止损距离 ≤ %.4f (1×ATR14)，当前距离 %.4f", maxDistance, distance)
+		}
+	}
+
 	if decision.PositionSizeUSD > maxNotional {
 		ratio := maxNotional / decision.PositionSizeUSD
 		log.Printf("  ⚖️ 自动下调 %s 仓位: %.2f → %.2f USDT (余额%.2f)", decision.Symbol, decision.PositionSizeUSD, maxNotional, availableBalance)
@@ -851,6 +873,20 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 	if decision.RiskUSD > 0 && decision.RiskUSD > maxRisk {
 		log.Printf("  ⚠️ 风险预算 %.2f USDT 超过余额 80%% (%.2f)，自动降至 %.2f", decision.RiskUSD, maxRisk, maxRisk)
 		decision.RiskUSD = maxRisk
+	}
+
+	// risk_usd 与净值挂钩（提示词约定 0.5%），避免 AI 输出与执行层不一致
+	if totalEquity > floatEpsilon {
+		expectedRisk := math.Max(totalEquity*0.005, 0.5)
+		if decision.RiskUSD <= 0 {
+			decision.RiskUSD = expectedRisk
+		} else {
+			diff := math.Abs(decision.RiskUSD - expectedRisk)
+			if diff > expectedRisk*0.5 {
+				log.Printf("  ⚠️ 调整 %s 风险预算: %.2f → %.2f (依据净值 %.2f)", decision.Symbol, decision.RiskUSD, expectedRisk, totalEquity)
+				decision.RiskUSD = expectedRisk
+			}
+		}
 	}
 
 	return nil
@@ -880,17 +916,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	if err != nil {
 		return err
 	}
-	if err := ensureMidTermEntryFilters(marketData, "short"); err != nil {
-		return err
-	}
 	if err := ensureMidTermEntryFilters(marketData, "long"); err != nil {
 		return err
 	}
-
-	// 计算数量
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
-	actionRecord.Quantity = quantity
-	actionRecord.Price = marketData.CurrentPrice
 
 	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
 	balance, err := at.trader.GetBalance()
@@ -902,9 +930,22 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		availableBalance = avail
 	}
 
-	if err := at.ensurePositionFitsBalance(decision, availableBalance); err != nil {
+	totalEquity := availableBalance
+	if total, ok := balance["totalWalletBalance"].(float64); ok && total > 0 {
+		totalEquity = total
+		if unrealized, ok := balance["totalUnrealizedProfit"].(float64); ok {
+			totalEquity += unrealized
+		}
+	}
+
+	if err := at.ensurePositionFitsBalance(decision, availableBalance, totalEquity, marketData); err != nil {
 		return err
 	}
+
+	// 计算数量（使用可能被调整后的仓位规模）
+	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
+	actionRecord.Quantity = quantity
+	actionRecord.Price = marketData.CurrentPrice
 
 	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
 	// 手续费估算（Taker费率 0.04%）
@@ -982,11 +1023,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	if err != nil {
 		return err
 	}
-
-	// 计算数量
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
-	actionRecord.Quantity = quantity
-	actionRecord.Price = marketData.CurrentPrice
+	if err := ensureMidTermEntryFilters(marketData, "short"); err != nil {
+		return err
+	}
 
 	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
 	balance, err := at.trader.GetBalance()
@@ -998,9 +1037,22 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		availableBalance = avail
 	}
 
-	if err := at.ensurePositionFitsBalance(decision, availableBalance); err != nil {
+	totalEquity := availableBalance
+	if total, ok := balance["totalWalletBalance"].(float64); ok && total > 0 {
+		totalEquity = total
+		if unrealized, ok := balance["totalUnrealizedProfit"].(float64); ok {
+			totalEquity += unrealized
+		}
+	}
+
+	if err := at.ensurePositionFitsBalance(decision, availableBalance, totalEquity, marketData); err != nil {
 		return err
 	}
+
+	// 计算数量（使用可能被调整后的仓位规模）
+	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
+	actionRecord.Quantity = quantity
+	actionRecord.Price = marketData.CurrentPrice
 
 	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
 	// 手续费估算（Taker费率 0.04%）
@@ -1297,6 +1349,19 @@ func (at *AutoTrader) executePartialCloseWithRecord(decision *decision.Decision,
 	// 计算平仓数量
 	totalQuantity := math.Abs(positionAmt)
 	closeQuantity := totalQuantity * (decision.ClosePercentage / 100.0)
+	minQty := at.estimateStepSize(decision.Symbol)
+	if closeQuantity < minQty {
+		if totalQuantity <= minQty+floatEpsilon {
+			closeQuantity = totalQuantity
+		} else {
+			log.Printf("  ⚠️ %s 部分平仓数量 %.6f 低于最小步长 %.6f，按最小值执行", decision.Symbol, closeQuantity, minQty)
+			closeQuantity = minQty
+		}
+	}
+	closeQuantity = at.roundQuantity(decision.Symbol, closeQuantity)
+	if closeQuantity <= 0 {
+		return fmt.Errorf("平仓数量过小，无法执行（步长 %.6f）", minQty)
+	}
 	actionRecord.Quantity = closeQuantity
 
 	// 执行平仓
@@ -1321,6 +1386,7 @@ func (at *AutoTrader) executePartialCloseWithRecord(decision *decision.Decision,
 		closeQuantity, decision.ClosePercentage, remainingQuantity)
 
 	at.handleRealizedPnL(decision.Symbol, strings.ToLower(positionSide), closeQuantity, marketData.CurrentPrice)
+	at.evaluateSymbolProtection(decision.Symbol)
 
 	return nil
 }
@@ -1860,6 +1926,266 @@ func normalizeSymbol(symbol string) string {
 	return symbol
 }
 
+type roiProfile struct {
+	breakeven float64
+	lock30    float64
+	lock50    float64
+	drawdown  float64
+	floor     float64
+}
+
+// roiProfileFor 返回不同杠杆下的 ROI 锁盈/回撤阈值
+func roiProfileFor(leverage int) roiProfile {
+	switch {
+	case leverage <= 2:
+		return roiProfile{breakeven: 6, lock30: 8, lock50: 12, drawdown: 40, floor: 0.7}
+	case leverage <= 5:
+		return roiProfile{breakeven: 3, lock30: 6, lock50: 10, drawdown: 35, floor: 2}
+	case leverage <= 10:
+		return roiProfile{breakeven: 2, lock30: 4, lock50: 7, drawdown: 30, floor: 3}
+	default:
+		return roiProfile{breakeven: 1.5, lock30: 3, lock50: 5, drawdown: 25, floor: 3.5}
+	}
+}
+
+// autoProtectionBuffer 返回更新止损时的最小缓冲，兼顾 tick size 与波动
+func (at *AutoTrader) autoProtectionBuffer(markPrice, atr float64) float64 {
+	buffer := markPrice * 0.0002
+	if atr > 0 {
+		buffer = math.Max(buffer, atr*0.05)
+	}
+	if buffer < 0.01 {
+		buffer = 0.01
+	}
+	return buffer
+}
+
+// pickTighterStop 选出“更紧”的止损（多单向上、空单向下），保持单调收敛
+func (at *AutoTrader) pickTighterStop(side string, current float64, hasCurrent bool, candidate float64) (float64, bool) {
+	if math.IsNaN(candidate) {
+		return current, hasCurrent
+	}
+	if !hasCurrent {
+		return candidate, true
+	}
+	if strings.ToLower(side) == "long" {
+		if candidate > current+floatEpsilon {
+			return candidate, true
+		}
+	} else {
+		if candidate < current-floatEpsilon {
+			return candidate, true
+		}
+	}
+	return current, hasCurrent
+}
+
+// positionRoiPct 基于入场价/行情价估算单仓 ROI%
+func (at *AutoTrader) positionRoiPct(side string, entryPrice, markPrice float64, leverage int) float64 {
+	if leverage <= 0 {
+		leverage = 1
+	}
+	if strings.ToLower(side) == "long" {
+		return ((markPrice - entryPrice) / entryPrice) * float64(leverage) * 100
+	}
+	return ((entryPrice - markPrice) / entryPrice) * float64(leverage) * 100
+}
+
+// atrStopCandidate 根据 ATR 档位给出新的止损候选
+func (at *AutoTrader) atrStopCandidate(side string, entryPrice, markPrice float64, data *market.Data) (float64, bool) {
+	if data == nil || data.MidTermContext == nil || data.MidTermContext.ATR14 <= 0 {
+		return 0, false
+	}
+	atr := data.MidTermContext.ATR14
+	gain := math.Abs(markPrice - entryPrice)
+	if gain <= 0 {
+		return 0, false
+	}
+
+	var target float64
+	hasCandidate := false
+	if gain >= atr {
+		target = entryPrice
+		hasCandidate = true
+	}
+	if gain >= 1.5*atr {
+		if strings.ToLower(side) == "long" {
+			target = entryPrice + 0.5*atr
+		} else {
+			target = entryPrice - 0.5*atr
+		}
+		hasCandidate = true
+	}
+	if gain >= 2*atr {
+		if strings.ToLower(side) == "long" {
+			target = markPrice - 2.5*atr
+		} else {
+			target = markPrice + 2.5*atr
+		}
+		hasCandidate = true
+	}
+	if !hasCandidate {
+		return 0, false
+	}
+	buffer := at.autoProtectionBuffer(markPrice, atr)
+	if strings.ToLower(side) == "long" {
+		target = math.Min(target, markPrice-buffer)
+	}
+	if strings.ToLower(side) == "short" {
+		target = math.Max(target, markPrice+buffer)
+	}
+	return target, true
+}
+
+// roiStopCandidate 根据 ROI 阶梯返回锁盈价格（叠加保底收益）
+func (at *AutoTrader) roiStopCandidate(side string, entryPrice, markPrice float64, leverage int, roiPct float64) (float64, bool) {
+	profile := roiProfileFor(leverage)
+	if roiPct < profile.breakeven {
+		return 0, false
+	}
+
+	gain := math.Abs(markPrice - entryPrice)
+	if gain <= 0 {
+		return 0, false
+	}
+
+	var candidate float64
+	if strings.ToLower(side) == "long" {
+		candidate = entryPrice
+	} else {
+		candidate = entryPrice
+	}
+
+	if roiPct >= profile.lock30 {
+		if strings.ToLower(side) == "long" {
+			candidate = entryPrice + gain*0.3
+		} else {
+			candidate = entryPrice - gain*0.3
+		}
+	}
+	if roiPct >= profile.lock50 {
+		if strings.ToLower(side) == "long" {
+			candidate = entryPrice + gain*0.5
+		} else {
+			candidate = entryPrice - gain*0.5
+		}
+	}
+
+	if profile.floor > 0 {
+		floorGain := (profile.floor / 100.0) / float64(leverage)
+		if strings.ToLower(side) == "long" {
+			minStop := entryPrice * (1 + floorGain)
+			candidate = math.Max(candidate, minStop)
+		} else {
+			minStop := entryPrice * (1 - floorGain)
+			candidate = math.Min(candidate, minStop)
+		}
+	}
+
+	buffer := at.autoProtectionBuffer(markPrice, gain)
+	if strings.ToLower(side) == "long" && candidate > markPrice-buffer {
+		candidate = markPrice - buffer
+	}
+	if strings.ToLower(side) == "short" && candidate < markPrice+buffer {
+		candidate = markPrice + buffer
+	}
+	return candidate, true
+}
+
+// dispatchAutoStopLoss 组装零延迟的 update_stop_loss 决策
+func (at *AutoTrader) dispatchAutoStopLoss(symbol, side string, newStop float64, reason string) {
+	dec := &decision.Decision{
+		Symbol:      symbol,
+		Action:      "update_stop_loss",
+		NewStopLoss: newStop,
+		Reasoning:   reason,
+	}
+	action := &logger.DecisionAction{
+		Action: "update_stop_loss",
+		Symbol: symbol,
+	}
+	if err := at.executeUpdateStopLossWithRecord(dec, action); err != nil {
+		log.Printf("⚠️ 自动锁盈更新 %s 失败: %v", symbol, err)
+	} else {
+		log.Printf("🔒 自动锁盈已收紧 %s (%s) → %.4f", symbol, side, newStop)
+	}
+}
+
+// applyDynamicProtection 综合 ATR/ROI 规则，必要时自动追踪止损
+func (at *AutoTrader) applyDynamicProtection(pos map[string]interface{}) {
+	symbol, _ := pos["symbol"].(string)
+	side, _ := pos["side"].(string)
+	entryPrice, _ := pos["entryPrice"].(float64)
+	markPrice, _ := pos["markPrice"].(float64)
+	positionAmt, _ := pos["positionAmt"].(float64)
+
+	if symbol == "" || side == "" || math.Abs(positionAmt) < floatEpsilon {
+		return
+	}
+
+	leverage := 1
+	if lev, ok := pos["leverage"].(float64); ok && lev > 0 {
+		leverage = int(math.Round(lev))
+		if leverage <= 0 {
+			leverage = 1
+		}
+	}
+
+	marketData, err := market.Get(symbol)
+	if err != nil {
+		log.Printf("⚠️ 自动锁盈获取行情失败(%s): %v", symbol, err)
+		return
+	}
+
+	currentStop, hasStop := at.getStopLoss(symbol, side)
+	targetStop := currentStop
+	targetExists := hasStop
+
+	if atrCandidate, ok := at.atrStopCandidate(side, entryPrice, markPrice, marketData); ok {
+		targetStop, targetExists = at.pickTighterStop(side, targetStop, targetExists, atrCandidate)
+	}
+
+	roiPct := at.positionRoiPct(side, entryPrice, markPrice, leverage)
+	if roiCandidate, ok := at.roiStopCandidate(side, entryPrice, markPrice, leverage, roiPct); ok {
+		targetStop, targetExists = at.pickTighterStop(side, targetStop, targetExists, roiCandidate)
+	}
+
+	if !targetExists {
+		return
+	}
+
+	if hasStop {
+		if strings.ToLower(side) == "long" && targetStop <= currentStop+floatEpsilon {
+			return
+		}
+		if strings.ToLower(side) == "short" && targetStop >= currentStop-floatEpsilon {
+			return
+		}
+	}
+
+	diff := math.Abs(targetStop - currentStop)
+	if hasStop && diff < marketData.CurrentPrice*0.0001 {
+		return
+	}
+
+	reason := fmt.Sprintf("自动锁盈触发 (ROI %.2f%%)", roiPct)
+	at.dispatchAutoStopLoss(symbol, side, targetStop, reason)
+}
+
+// evaluateSymbolProtection 在部分平仓/锁盈后重新评估剩余仓位
+func (at *AutoTrader) evaluateSymbolProtection(symbol string) {
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		log.Printf("⚠️ 重新计算锁盈时获取持仓失败: %v", err)
+		return
+	}
+	for _, pos := range positions {
+		if posSymbol, _ := pos["symbol"].(string); posSymbol == symbol {
+			at.applyDynamicProtection(pos)
+		}
+	}
+}
+
 // 启动回撤监控
 func (at *AutoTrader) startDrawdownMonitor() {
 	at.monitorWg.Add(1)
@@ -1901,58 +2227,37 @@ func (at *AutoTrader) checkPositionDrawdown() {
 		if quantity < 0 {
 			quantity = -quantity // 空仓数量为负，转为正数
 		}
+		if quantity < floatEpsilon {
+			continue
+		}
 
-		// 计算当前盈亏百分比
 		leverage := 10 // 默认值
-		if lev, ok := pos["leverage"].(float64); ok {
+		if lev, ok := pos["leverage"].(float64); ok && lev > 0 {
 			leverage = int(lev)
 		}
 
-		var currentPnLPct float64
-		if side == "long" {
-			currentPnLPct = ((markPrice - entryPrice) / entryPrice) * float64(leverage) * 100
-		} else {
-			currentPnLPct = ((entryPrice - markPrice) / entryPrice) * float64(leverage) * 100
-		}
+		currentPnLPct := at.positionRoiPct(side, entryPrice, markPrice, leverage)
+		at.UpdatePeakPnL(symbol, side, currentPnLPct)
+		peakPnLPct, exists := at.getPeakPnL(symbol, side)
 
-		// 获取该持仓的历史最高收益
-		at.peakPnLCacheMutex.RLock()
-		peakPnLPct, exists := at.peakPnLCache[symbol]
-		at.peakPnLCacheMutex.RUnlock()
-
-		if !exists {
-			// 如果没有历史最高记录，使用当前盈亏作为初始值
-			peakPnLPct = currentPnLPct
-			at.UpdatePeakPnL(symbol, currentPnLPct)
-		} else {
-			// 更新峰值缓存
-			at.UpdatePeakPnL(symbol, currentPnLPct)
-		}
-
-		// 计算回撤（从最高点下跌的幅度）
-		var drawdownPct float64
-		if peakPnLPct > 0 && currentPnLPct < peakPnLPct {
-			drawdownPct = ((peakPnLPct - currentPnLPct) / peakPnLPct) * 100
-		}
-
-		// 检查平仓条件：收益大于5%且回撤超过40%
-		if currentPnLPct > 5.0 && drawdownPct >= 40.0 {
-			log.Printf("🚨 触发回撤平仓条件: %s %s | 当前收益: %.2f%% | 最高收益: %.2f%% | 回撤: %.2f%%",
-				symbol, side, currentPnLPct, peakPnLPct, drawdownPct)
-
-			// 执行平仓
-			if err := at.emergencyClosePosition(symbol, side); err != nil {
-				log.Printf("❌ 回撤平仓失败 (%s %s): %v", symbol, side, err)
-			} else {
-				log.Printf("✅ 回撤平仓成功: %s %s", symbol, side)
-				// 平仓后清理该symbol的缓存
-				at.ClearPeakPnLCache(symbol)
+		if exists && peakPnLPct > 0 && currentPnLPct < peakPnLPct {
+			drawdownPct := ((peakPnLPct - currentPnLPct) / peakPnLPct) * 100
+			profile := roiProfileFor(leverage)
+			if peakPnLPct >= profile.breakeven && drawdownPct >= profile.drawdown {
+				log.Printf("🚨 回撤保护触发: %s %s | 当前收益 %.2f%% | 峰值 %.2f%% | 回撤 %.2f%%",
+					symbol, side, currentPnLPct, peakPnLPct, drawdownPct)
+				if err := at.emergencyClosePosition(symbol, side); err != nil {
+					log.Printf("❌ 回撤平仓失败 (%s %s): %v", symbol, side, err)
+				} else {
+					log.Printf("✅ 回撤平仓成功: %s %s", symbol, side)
+					at.ClearPeakPnLCache(symbol, side)
+					continue
+				}
 			}
-		} else if currentPnLPct > 5.0 {
-			// 记录接近平仓条件的情况（用于调试）
-			log.Printf("📊 回撤监控: %s %s | 收益: %.2f%% | 最高: %.2f%% | 回撤: %.2f%%",
-				symbol, side, currentPnLPct, peakPnLPct, drawdownPct)
 		}
+
+		// 根据实时盈亏尝试自动锁盈
+		at.applyDynamicProtection(pos)
 	}
 }
 
@@ -2003,31 +2308,62 @@ func (at *AutoTrader) GetPeakPnLCache() map[string]float64 {
 }
 
 // UpdatePeakPnL 更新最高收益缓存
-func (at *AutoTrader) UpdatePeakPnL(symbol string, currentPnLPct float64) {
+func (at *AutoTrader) getPeakPnL(symbol, side string) (float64, bool) {
+	key := at.positionKey(symbol, side)
+	at.peakPnLCacheMutex.RLock()
+	defer at.peakPnLCacheMutex.RUnlock()
+	val, ok := at.peakPnLCache[key]
+	return val, ok
+}
+
+func (at *AutoTrader) UpdatePeakPnL(symbol, side string, currentPnLPct float64) {
 	at.peakPnLCacheMutex.Lock()
 	defer at.peakPnLCacheMutex.Unlock()
 
-	if peak, exists := at.peakPnLCache[symbol]; exists {
+	key := at.positionKey(symbol, side)
+	if peak, exists := at.peakPnLCache[key]; exists {
 		// 更新峰值（如果是多头，取较大值；如果是空头，currentPnLPct为负，也要比较）
 		if currentPnLPct > peak {
-			at.peakPnLCache[symbol] = currentPnLPct
+			at.peakPnLCache[key] = currentPnLPct
 		}
 	} else {
 		// 首次记录
-		at.peakPnLCache[symbol] = currentPnLPct
+		at.peakPnLCache[key] = currentPnLPct
 	}
 }
 
 // ClearPeakPnLCache 清除指定symbol的峰值缓存
-func (at *AutoTrader) ClearPeakPnLCache(symbol string) {
+func (at *AutoTrader) ClearPeakPnLCache(symbol, side string) {
 	at.peakPnLCacheMutex.Lock()
 	defer at.peakPnLCacheMutex.Unlock()
 
-	delete(at.peakPnLCache, symbol)
+	key := at.positionKey(symbol, side)
+	delete(at.peakPnLCache, key)
 }
 
 func (at *AutoTrader) positionKey(symbol, side string) string {
 	return fmt.Sprintf("%s_%s", symbol, strings.ToLower(side))
+}
+
+func (at *AutoTrader) estimateStepSize(symbol string) float64 {
+	upper := strings.ToUpper(symbol)
+	switch {
+	case strings.HasPrefix(upper, "BTC"):
+		return 0.001
+	case strings.HasPrefix(upper, "ETH"):
+		return 0.01
+	default:
+		return 0.1
+	}
+}
+
+func (at *AutoTrader) roundQuantity(symbol string, qty float64) float64 {
+	step := at.estimateStepSize(symbol)
+	if step <= 0 {
+		step = 0.000001
+	}
+	steps := math.Floor(qty/step + 1e-9)
+	return steps * step
 }
 
 func (at *AutoTrader) storePositionMeta(symbol, side string, entryPrice, quantity float64) {
