@@ -789,19 +789,19 @@ func ensureMidTermEntryFilters(data *market.Data, direction string) error {
 	switch direction {
 	case "long":
 		upper := mt.EMA20 + 0.6*mt.ATR14
-		if mt.RSI7 > 68 {
+		if mt.RSI7 > 72 {
 			return fmt.Errorf("15m RSI(7)=%.2f 超出72，提示词要求 wait", mt.RSI7)
 		}
 		if price > upper {
-			return fmt.Errorf("价格 %.2f 高于 15m EMA20+0.6ATR(%.2f)，拒绝追多", price, upper)
+			return fmt.Errorf("价格 %.2f 高于 15m EMA20+0.8ATR(%.2f)，拒绝追多", price, upper)
 		}
 	case "short":
 		lower := mt.EMA20 - 0.6*mt.ATR14
-		if mt.RSI7 < 32 {
+		if mt.RSI7 < 28 {
 			return fmt.Errorf("15m RSI(7)=%.2f 低于28，提示词要求 wait", mt.RSI7)
 		}
 		if price < lower {
-			return fmt.Errorf("价格 %.2f 低于 15m EMA20-0.6ATR(%.2f)，拒绝追空", price, lower)
+			return fmt.Errorf("价格 %.2f 低于 15m EMA20-0.8ATR(%.2f)，拒绝追空", price, lower)
 		}
 	default:
 		return fmt.Errorf("未知方向: %s", direction)
