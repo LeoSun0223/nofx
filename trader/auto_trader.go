@@ -850,15 +850,6 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 				decision.RiskUSD *= ratio
 			}
 		}
-
-		if marketData == nil || marketData.MidTermContext == nil || marketData.MidTermContext.ATR14 <= 0 {
-			return fmt.Errorf("小账户模式需要ATR数据，当前无法验证止损距离")
-		}
-		distance := math.Abs(decision.StopLoss - marketData.CurrentPrice)
-		maxDistance := marketData.MidTermContext.ATR14
-		if distance > maxDistance {
-			return fmt.Errorf("小账户模式要求止损距离 ≤ %.4f (1×ATR14)，当前距离 %.4f", maxDistance, distance)
-		}
 	}
 
 	if decision.PositionSizeUSD > maxNotional {
@@ -889,7 +880,96 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 		}
 	}
 
+	if totalEquity > floatEpsilon && totalEquity < 150 {
+		if err := at.tightenStopLossIfNeeded(decision, marketData); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+func (at *AutoTrader) tightenStopLossIfNeeded(decision *decision.Decision, data *market.Data) error {
+	if decision == nil || data == nil {
+		return nil
+	}
+
+	allowed, err := allowedStopDistance(data)
+	if err != nil || allowed <= 0 {
+		return err
+	}
+
+	currentDistance := math.Abs(decision.StopLoss - data.CurrentPrice)
+	if currentDistance <= allowed+floatEpsilon {
+		return nil
+	}
+
+	isLong := strings.EqualFold(decision.Action, "open_long")
+	if !isLong && !strings.EqualFold(decision.Action, "open_short") {
+		isLong = decision.StopLoss < data.CurrentPrice
+	}
+
+	var newStop float64
+	if isLong {
+		newStop = data.CurrentPrice - allowed
+		if newStop <= 0 {
+			newStop = data.CurrentPrice * 0.99
+		}
+	} else {
+		newStop = data.CurrentPrice + allowed
+	}
+
+	log.Printf("  🧊 自动收紧 %s 止损: %.2f → %.2f (允许距离 %.2f)", decision.Symbol, decision.StopLoss, newStop, allowed)
+	decision.StopLoss = newStop
+
+	adjustedDistance := math.Abs(data.CurrentPrice - decision.StopLoss)
+	if adjustedDistance < floatEpsilon {
+		adjustedDistance = allowed
+	}
+
+	if decision.RiskUSD > floatEpsilon {
+		maxQtyByRisk := decision.RiskUSD / adjustedDistance
+		if maxQtyByRisk <= 0 {
+			return fmt.Errorf("风险预算不足以覆盖止损距离 %.4f", adjustedDistance)
+		}
+		maxPositionByRisk := maxQtyByRisk * data.CurrentPrice
+		if maxPositionByRisk < decision.PositionSizeUSD {
+			log.Printf("  🧮 根据 risk_usd 压缩仓位: %.2f → %.2f (距=%.2f)", decision.PositionSizeUSD, maxPositionByRisk, adjustedDistance)
+			decision.PositionSizeUSD = maxPositionByRisk
+		}
+	}
+
+	return nil
+}
+
+func allowedStopDistance(data *market.Data) (float64, error) {
+	if data == nil {
+		return 0, fmt.Errorf("缺少行情数据，无法计算 ATR")
+	}
+
+	if data.LongerTermContext != nil && data.LongerTermContext.ATR14 > 0 {
+		return data.LongerTermContext.ATR14, nil
+	}
+
+	candidates := []float64{}
+	if data.MidTermContext != nil && data.MidTermContext.ATR14 > 0 {
+		candidates = append(candidates, data.MidTermContext.ATR14*1.5)
+	}
+	if data.CurrentPrice > 0 {
+		candidates = append(candidates, data.CurrentPrice*0.015)
+	}
+
+	allowed := 0.0
+	for _, c := range candidates {
+		if c > allowed {
+			allowed = c
+		}
+	}
+
+	if allowed <= 0 {
+		return 0, fmt.Errorf("无法计算止损距离（ATR缺失）")
+	}
+	return allowed, nil
 }
 
 // executeOpenLongWithRecord 执行开多仓并记录详细信息
