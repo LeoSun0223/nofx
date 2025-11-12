@@ -850,6 +850,18 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 				decision.RiskUSD *= ratio
 			}
 		}
+
+		if marketData == nil {
+			return fmt.Errorf("小账户模式需要行情数据以验证止损距离")
+		}
+		allowed, err := allowedStopDistance(marketData)
+		if err != nil || allowed <= 0 {
+			return fmt.Errorf("小账户模式需要 ATR14(1h) 数据: %v", err)
+		}
+		distance := math.Abs(decision.StopLoss - marketData.CurrentPrice)
+		if distance > allowed {
+			return fmt.Errorf("小账户模式要求初始止损距离 ≤ %.2f (≈1×ATR14 1h)，当前 %.2f；请重新计算止损/仓位", allowed, distance)
+		}
 	}
 
 	if decision.PositionSizeUSD > maxNotional {
@@ -877,65 +889,6 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 				log.Printf("  ⚠️ 调整 %s 风险预算: %.2f → %.2f (依据净值 %.2f)", decision.Symbol, decision.RiskUSD, expectedRisk, totalEquity)
 				decision.RiskUSD = expectedRisk
 			}
-		}
-	}
-
-	if totalEquity > floatEpsilon && totalEquity < 150 {
-		if err := at.tightenStopLossIfNeeded(decision, marketData); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (at *AutoTrader) tightenStopLossIfNeeded(decision *decision.Decision, data *market.Data) error {
-	if decision == nil || data == nil {
-		return nil
-	}
-
-	allowed, err := allowedStopDistance(data)
-	if err != nil || allowed <= 0 {
-		return err
-	}
-
-	currentDistance := math.Abs(decision.StopLoss - data.CurrentPrice)
-	if currentDistance <= allowed+floatEpsilon {
-		return nil
-	}
-
-	isLong := strings.EqualFold(decision.Action, "open_long")
-	if !isLong && !strings.EqualFold(decision.Action, "open_short") {
-		isLong = decision.StopLoss < data.CurrentPrice
-	}
-
-	var newStop float64
-	if isLong {
-		newStop = data.CurrentPrice - allowed
-		if newStop <= 0 {
-			newStop = data.CurrentPrice * 0.99
-		}
-	} else {
-		newStop = data.CurrentPrice + allowed
-	}
-
-	log.Printf("  🧊 自动收紧 %s 止损: %.2f → %.2f (允许距离 %.2f)", decision.Symbol, decision.StopLoss, newStop, allowed)
-	decision.StopLoss = newStop
-
-	adjustedDistance := math.Abs(data.CurrentPrice - decision.StopLoss)
-	if adjustedDistance < floatEpsilon {
-		adjustedDistance = allowed
-	}
-
-	if decision.RiskUSD > floatEpsilon {
-		maxQtyByRisk := decision.RiskUSD / adjustedDistance
-		if maxQtyByRisk <= 0 {
-			return fmt.Errorf("风险预算不足以覆盖止损距离 %.4f", adjustedDistance)
-		}
-		maxPositionByRisk := maxQtyByRisk * data.CurrentPrice
-		if maxPositionByRisk < decision.PositionSizeUSD {
-			log.Printf("  🧮 根据 risk_usd 压缩仓位: %.2f → %.2f (距=%.2f)", decision.PositionSizeUSD, maxPositionByRisk, adjustedDistance)
-			decision.PositionSizeUSD = maxPositionByRisk
 		}
 	}
 
@@ -2072,12 +2025,11 @@ func (at *AutoTrader) positionRoiPct(side string, entryPrice, markPrice float64,
 }
 
 // atrStopCandidate 根据 ATR 档位给出新的止损候选
-func (at *AutoTrader) atrStopCandidate(side string, entryPrice, markPrice float64, data *market.Data) (float64, bool) {
+func (at *AutoTrader) atrStopCandidate(side string, entryPrice, markPrice, gain float64, data *market.Data) (float64, bool) {
 	if data == nil || data.MidTermContext == nil || data.MidTermContext.ATR14 <= 0 {
 		return 0, false
 	}
 	atr := data.MidTermContext.ATR14
-	gain := math.Abs(markPrice - entryPrice)
 	if gain <= 0 {
 		return 0, false
 	}
@@ -2118,13 +2070,12 @@ func (at *AutoTrader) atrStopCandidate(side string, entryPrice, markPrice float6
 }
 
 // roiStopCandidate 根据 ROI 阶梯返回锁盈价格（叠加保底收益）
-func (at *AutoTrader) roiStopCandidate(side string, entryPrice, markPrice float64, leverage int, roiPct float64) (float64, bool) {
+func (at *AutoTrader) roiStopCandidate(side string, entryPrice, markPrice float64, leverage int, roiPct, gain float64) (float64, bool) {
 	profile := roiProfileFor(leverage)
 	if roiPct < profile.breakeven {
 		return 0, false
 	}
 
-	gain := math.Abs(markPrice - entryPrice)
 	if gain <= 0 {
 		return 0, false
 	}
@@ -2172,6 +2123,20 @@ func (at *AutoTrader) roiStopCandidate(side string, entryPrice, markPrice float6
 	return candidate, true
 }
 
+// floatingGain 计算多/空持仓的正向浮盈（亏损则返回0）
+func floatingGain(side string, entryPrice, markPrice float64) float64 {
+	if strings.EqualFold(side, "long") {
+		if markPrice > entryPrice {
+			return markPrice - entryPrice
+		}
+		return 0
+	}
+	if entryPrice > markPrice {
+		return entryPrice - markPrice
+	}
+	return 0
+}
+
 // dispatchAutoStopLoss 组装零延迟的 update_stop_loss 决策
 func (at *AutoTrader) dispatchAutoStopLoss(symbol, side string, newStop float64, reason string) {
 	dec := &decision.Decision{
@@ -2211,6 +2176,11 @@ func (at *AutoTrader) applyDynamicProtection(pos map[string]interface{}) {
 		}
 	}
 
+	gain := floatingGain(side, entryPrice, markPrice)
+	if gain <= floatEpsilon {
+		return // 浮盈未达到，暂不收紧止损
+	}
+
 	marketData, err := market.Get(symbol)
 	if err != nil {
 		log.Printf("⚠️ 自动锁盈获取行情失败(%s): %v", symbol, err)
@@ -2221,12 +2191,12 @@ func (at *AutoTrader) applyDynamicProtection(pos map[string]interface{}) {
 	targetStop := currentStop
 	targetExists := hasStop
 
-	if atrCandidate, ok := at.atrStopCandidate(side, entryPrice, markPrice, marketData); ok {
+	if atrCandidate, ok := at.atrStopCandidate(side, entryPrice, markPrice, gain, marketData); ok {
 		targetStop, targetExists = at.pickTighterStop(side, targetStop, targetExists, atrCandidate)
 	}
 
 	roiPct := at.positionRoiPct(side, entryPrice, markPrice, leverage)
-	if roiCandidate, ok := at.roiStopCandidate(side, entryPrice, markPrice, leverage, roiPct); ok {
+	if roiCandidate, ok := at.roiStopCandidate(side, entryPrice, markPrice, leverage, roiPct, gain); ok {
 		targetStop, targetExists = at.pickTighterStop(side, targetStop, targetExists, roiCandidate)
 	}
 
