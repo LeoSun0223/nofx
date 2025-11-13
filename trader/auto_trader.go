@@ -75,6 +75,14 @@ type AutoTraderConfig struct {
 
 	// 系统提示词模板
 	SystemPromptTemplate string // 系统提示词模板名称（如 "default", "aggressive"）
+
+	// 止损收紧节流（执行层保护）
+	MinStopAdjustHold              time.Duration // 最小持仓时间，低于该值拒绝收紧止损
+	MinStopAdjustROI               float64       // 最小ROI阈值（%），低于该值拒绝收紧止损
+	MinStopAdjustATRs              float64       // 止损离入场的最小 ATR 倍数
+	MinStopUpdateInterval          time.Duration // 连续两次收紧之间的最小间隔
+	AllowImmediateTighteningROI    *bool         // 当 ROI 超过指定倍数时，是否允许忽略持仓时长
+	ImmediateTighteningROIMultiple float64       // ROI 触发倍数（例如 2×MinStopAdjustROI）
 }
 
 // AutoTrader 自动交易器
@@ -112,6 +120,8 @@ type AutoTrader struct {
 	takeProfitCache       map[string]float64       // 缓存止盈价，便于动态调整
 	positionMetaMutex     sync.Mutex               // 保护 positionMeta/stopLossCache 的并发访问
 	consecutiveLosses     int                      // 连续亏损计数，驱动自动暂停
+	lastStopUpdate        map[string]time.Time     // 最近一次收紧止损时间
+	stopUpdateMutex       sync.RWMutex             // 保护 lastStopUpdate
 }
 
 const (
@@ -127,6 +137,27 @@ type positionMeta struct {
 
 // NewAutoTrader 创建自动交易器
 func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string) (*AutoTrader, error) {
+	// 止损节流参数默认值
+	if config.MinStopAdjustHold == 0 {
+		config.MinStopAdjustHold = 12 * time.Minute
+	}
+	if config.MinStopAdjustROI <= 0 {
+		config.MinStopAdjustROI = 1.2
+	}
+	if config.MinStopAdjustATRs <= 0 {
+		config.MinStopAdjustATRs = 0.6
+	}
+	if config.MinStopUpdateInterval == 0 {
+		config.MinStopUpdateInterval = 3 * time.Minute
+	}
+	if config.ImmediateTighteningROIMultiple <= 0 {
+		config.ImmediateTighteningROIMultiple = 2.0
+	}
+	if config.AllowImmediateTighteningROI == nil {
+		defaultAllow := true
+		config.AllowImmediateTighteningROI = &defaultAllow
+	}
+
 	// 设置默认值
 	if config.ID == "" {
 		config.ID = "default_trader"
@@ -250,6 +281,7 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		stopLossCache:         make(map[string]float64),
 		takeProfitCache:       make(map[string]float64),
 		positionMetaMutex:     sync.Mutex{},
+		lastStopUpdate:        make(map[string]time.Time),
 		lastBalanceSyncTime:   time.Now(), // 初始化为当前时间
 		database:              database,
 		userID:                userID,
@@ -669,7 +701,7 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		totalMarginUsed += marginUsed
 
 		// 跟踪持仓首次出现时间
-		posKey := symbol + "_" + side
+		posKey := at.positionKey(symbol, side)
 		currentPositionKeys[posKey] = true
 		if _, exists := at.positionFirstSeenTime[posKey]; !exists {
 			// 新持仓，记录当前时间
@@ -696,6 +728,9 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 	for key := range at.positionFirstSeenTime {
 		if !currentPositionKeys[key] {
 			delete(at.positionFirstSeenTime, key)
+			at.stopUpdateMutex.Lock()
+			delete(at.lastStopUpdate, key)
+			at.stopUpdateMutex.Unlock()
 		}
 	}
 
@@ -1067,7 +1102,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	at.storePositionMeta(decision.Symbol, "long", marketData.CurrentPrice, quantity)
 
 	// 记录开仓时间
-	posKey := decision.Symbol + "_long"
+	posKey := at.positionKey(decision.Symbol, "long")
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
 	// 设置止损止盈
@@ -1177,7 +1212,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	at.storePositionMeta(decision.Symbol, "short", marketData.CurrentPrice, quantity)
 
 	// 记录开仓时间
-	posKey := decision.Symbol + "_short"
+	posKey := at.positionKey(decision.Symbol, "short")
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
 	// 设置止损止盈
@@ -1297,6 +1332,7 @@ func (at *AutoTrader) executeUpdateStopLossWithRecord(decision *decision.Decisio
 	// 获取持仓方向和数量
 	side, _ := targetPosition["side"].(string)
 	positionSide := strings.ToUpper(side)
+	normalizedSide := strings.ToLower(positionSide)
 	positionAmt, _ := targetPosition["positionAmt"].(float64)
 
 	// 验证新止损价格合理性
@@ -1308,6 +1344,19 @@ func (at *AutoTrader) executeUpdateStopLossWithRecord(decision *decision.Decisio
 	}
 
 	if err := at.ensureStopLossTightening(decision.Symbol, positionSide, decision.NewStopLoss); err != nil {
+		return err
+	}
+
+	entryPrice, _ := targetPosition["entryPrice"].(float64)
+	leverage := 1
+	if lev, ok := targetPosition["leverage"].(float64); ok && lev > 0 {
+		leverage = int(math.Round(lev))
+	}
+	atr := 0.0
+	if marketData.MidTermContext != nil {
+		atr = marketData.MidTermContext.ATR14
+	}
+	if err := at.validateStopTightening(decision.Symbol, normalizedSide, entryPrice, marketData.CurrentPrice, decision.NewStopLoss, atr, leverage); err != nil {
 		return err
 	}
 
@@ -1325,6 +1374,7 @@ func (at *AutoTrader) executeUpdateStopLossWithRecord(decision *decision.Decisio
 	}
 
 	at.storeStopLoss(decision.Symbol, positionSide, decision.NewStopLoss)
+	at.markStopUpdate(decision.Symbol, normalizedSide)
 
 	log.Printf("  ✓ 止损已调整: %.2f (当前价格: %.2f)", decision.NewStopLoss, marketData.CurrentPrice)
 	return nil
@@ -2180,6 +2230,86 @@ func (at *AutoTrader) roiStopCandidate(side string, entryPrice, markPrice float6
 	return candidate, true
 }
 
+// shouldBypassHoldDuration 当 ROI 达到倍数阈值时允许忽略最小持仓时长
+func (at *AutoTrader) shouldBypassHoldDuration(roi float64) bool {
+	if at.config.AllowImmediateTighteningROI == nil || !*at.config.AllowImmediateTighteningROI {
+		return false
+	}
+	if at.config.MinStopAdjustROI <= 0 {
+		return false
+	}
+	multiple := at.config.ImmediateTighteningROIMultiple
+	if multiple <= 0 {
+		return false
+	}
+	return roi >= at.config.MinStopAdjustROI*multiple
+}
+
+// positionHoldDuration 返回该仓位已持有时间
+func (at *AutoTrader) positionHoldDuration(symbol, side string) time.Duration {
+	key := at.positionKey(symbol, side)
+	if firstSeen, ok := at.positionFirstSeenTime[key]; ok && firstSeen > 0 {
+		return time.Since(time.UnixMilli(firstSeen))
+	}
+	return at.config.MinStopAdjustHold
+}
+
+func (at *AutoTrader) timeSinceLastStopUpdate(symbol, side string) time.Duration {
+	key := at.positionKey(symbol, side)
+	at.stopUpdateMutex.RLock()
+	last, ok := at.lastStopUpdate[key]
+	at.stopUpdateMutex.RUnlock()
+	if !ok {
+		return at.config.MinStopUpdateInterval
+	}
+	return time.Since(last)
+}
+
+func (at *AutoTrader) markStopUpdate(symbol, side string) {
+	key := at.positionKey(symbol, side)
+	at.stopUpdateMutex.Lock()
+	at.lastStopUpdate[key] = time.Now()
+	at.stopUpdateMutex.Unlock()
+}
+
+func (at *AutoTrader) clearStopUpdateTimestamp(symbol, side string) {
+	key := at.positionKey(symbol, side)
+	at.stopUpdateMutex.Lock()
+	delete(at.lastStopUpdate, key)
+	at.stopUpdateMutex.Unlock()
+}
+
+// validateStopTightening 执行层统一校验止损收紧的节流规则
+func (at *AutoTrader) validateStopTightening(symbol, side string, entryPrice, currentPrice, newStop, atr float64, leverage int) error {
+	minROI := at.config.MinStopAdjustROI
+	roi := at.positionRoiPct(side, entryPrice, currentPrice, leverage)
+	if minROI > 0 && roi+floatEpsilon < minROI {
+		return fmt.Errorf("ROI %.2f%% 未达到最小阈值 %.2f%%", roi, minROI)
+	}
+
+	hold := at.positionHoldDuration(symbol, side)
+	if at.config.MinStopAdjustHold > 0 && hold < at.config.MinStopAdjustHold && !at.shouldBypassHoldDuration(roi) {
+		return fmt.Errorf("持仓仅 %s，未达到最小持仓时长 %s", hold.Truncate(time.Second), at.config.MinStopAdjustHold)
+	}
+
+	if at.config.MinStopUpdateInterval > 0 {
+		elapsed := at.timeSinceLastStopUpdate(symbol, side)
+		if elapsed < at.config.MinStopUpdateInterval {
+			return fmt.Errorf("距离上次收紧仅过去 %s (< %s)", elapsed.Truncate(time.Second), at.config.MinStopUpdateInterval)
+		}
+	}
+
+	if atr > 0 && at.config.MinStopAdjustATRs > 0 {
+		minDistance := atr * at.config.MinStopAdjustATRs
+		distance := math.Abs(entryPrice - newStop)
+		if distance+floatEpsilon < minDistance {
+			return fmt.Errorf("止损需至少距离入场 %.2f (ATR×%.2f)，当前 %.2f", minDistance, at.config.MinStopAdjustATRs, distance)
+		}
+	}
+
+	return nil
+}
+
 // floatingGain 计算多/空持仓的正向浮盈（亏损则返回0）
 func floatingGain(side string, entryPrice, markPrice float64) float64 {
 	if strings.EqualFold(side, "long") {
@@ -2272,6 +2402,15 @@ func (at *AutoTrader) applyDynamicProtection(pos map[string]interface{}) {
 
 	diff := math.Abs(targetStop - currentStop)
 	if hasStop && diff < marketData.CurrentPrice*0.0001 {
+		return
+	}
+
+	atr := 0.0
+	if marketData.MidTermContext != nil {
+		atr = marketData.MidTermContext.ATR14
+	}
+	if err := at.validateStopTightening(symbol, strings.ToLower(side), entryPrice, markPrice, targetStop, atr, leverage); err != nil {
+		log.Printf("⚠️ 自动锁盈跳过 (%s %s): %v", symbol, side, err)
 		return
 	}
 
@@ -2569,6 +2708,7 @@ func (at *AutoTrader) handleRealizedPnL(symbol, side string, closedQuantity, clo
 		delete(at.positionMeta, key)
 		delete(at.stopLossCache, key)
 		delete(at.takeProfitCache, key)
+		at.clearStopUpdateTimestamp(symbol, side)
 	} else {
 		meta.Quantity = remaining
 		at.positionMeta[key] = meta
