@@ -810,6 +810,41 @@ func ensureMidTermEntryFilters(data *market.Data, direction string) error {
 	return nil
 }
 
+// ensureShortTermMomentum 要求 3m 指标确认方向（防追价/逆势）
+func ensureShortTermMomentum(data *market.Data, direction string) error {
+	if data == nil {
+		return fmt.Errorf("缺少短周期指标，无法验证%s条件", direction)
+	}
+
+	macd := data.CurrentMACD
+	switch direction {
+	case "long":
+		if macd < -floatEpsilon {
+			return fmt.Errorf("3m MACD=%.2f 仍为负值，短线动能未转多", macd)
+		}
+	case "short":
+		if macd > floatEpsilon {
+			return fmt.Errorf("3m MACD=%.2f 仍为正值，短线动能未转空", macd)
+		}
+	default:
+		return fmt.Errorf("未知方向: %s", direction)
+	}
+
+	if series := data.IntradaySeries; series != nil && len(series.RSI7Values) >= 2 {
+		last := series.RSI7Values[len(series.RSI7Values)-1]
+		prev := series.RSI7Values[len(series.RSI7Values)-2]
+		slope := last - prev
+		if direction == "long" && slope < -0.2 {
+			return fmt.Errorf("3m RSI 未出现回升确认 (%.2f→%.2f)", prev, last)
+		}
+		if direction == "short" && slope > 0.2 {
+			return fmt.Errorf("3m RSI 未出现回落确认 (%.2f→%.2f)", prev, last)
+		}
+	}
+
+	return nil
+}
+
 func isMajorPair(symbol string) bool {
 	s := strings.ToUpper(symbol)
 	return s == "BTCUSDT" || s == "ETHUSDT"
@@ -839,8 +874,22 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 
 	maxRisk := availableBalance * 0.8
 
+	if marketData == nil {
+		return fmt.Errorf("需要行情数据以验证止损距离")
+	}
+	allowed, err := allowedStopDistance(marketData)
+	if err != nil || allowed <= 0 {
+		return fmt.Errorf("缺少 ATR14(1h) 数据，无法验证止损距离: %v", err)
+	}
+	distance := math.Abs(decision.StopLoss - marketData.CurrentPrice)
+	if distance > allowed {
+		return fmt.Errorf("初始止损距离 %.2f 超出允许 %.2f (≈1×ATR14 1h)，请重新计算止损或仓位", distance, allowed)
+	}
+
+	isSmallAccount := totalEquity > floatEpsilon && totalEquity < 150
+
 	// 小账户模式：净值低于 150U 时收紧所有关键约束，防止 AI 过度下单
-	if totalEquity > floatEpsilon && totalEquity < 150 {
+	if isSmallAccount {
 		maxNotionalByEquity := totalEquity
 		if decision.PositionSizeUSD > maxNotionalByEquity {
 			ratio := maxNotionalByEquity / decision.PositionSizeUSD
@@ -850,17 +899,19 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 				decision.RiskUSD *= ratio
 			}
 		}
-
-		if marketData == nil {
-			return fmt.Errorf("小账户模式需要行情数据以验证止损距离")
+	} else if totalEquity > floatEpsilon {
+		softMultiplier := 1.5
+		if isMajorPair(decision.Symbol) {
+			softMultiplier = 3.0
 		}
-		allowed, err := allowedStopDistance(marketData)
-		if err != nil || allowed <= 0 {
-			return fmt.Errorf("小账户模式需要 ATR14(1h) 数据: %v", err)
-		}
-		distance := math.Abs(decision.StopLoss - marketData.CurrentPrice)
-		if distance > allowed {
-			return fmt.Errorf("小账户模式要求初始止损距离 ≤ %.2f (≈1×ATR14 1h)，当前 %.2f；请重新计算止损/仓位", allowed, distance)
+		softCap := totalEquity * softMultiplier
+		if softCap > floatEpsilon && decision.PositionSizeUSD > softCap {
+			ratio := softCap / decision.PositionSizeUSD
+			log.Printf("  🪢 标准模式软性仓位上限: %s %.2f → %.2f USDT (净值%.2f×%.1f)", decision.Symbol, decision.PositionSizeUSD, softCap, totalEquity, softMultiplier)
+			decision.PositionSizeUSD = softCap
+			if decision.RiskUSD > 0 {
+				decision.RiskUSD *= ratio
+			}
 		}
 	}
 
@@ -950,6 +1001,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		return err
 	}
 	if err := ensureMidTermEntryFilters(marketData, "long"); err != nil {
+		return err
+	}
+	if err := ensureShortTermMomentum(marketData, "long"); err != nil {
 		return err
 	}
 
@@ -1057,6 +1111,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		return err
 	}
 	if err := ensureMidTermEntryFilters(marketData, "short"); err != nil {
+		return err
+	}
+	if err := ensureShortTermMomentum(marketData, "short"); err != nil {
 		return err
 	}
 
@@ -2156,7 +2213,7 @@ func (at *AutoTrader) dispatchAutoStopLoss(symbol, side string, newStop float64,
 	}
 }
 
-// applyDynamicProtection 综合 ATR/ROI 规则，必要时自动追踪止损
+// applyDynamicProtection 综合 ATR/ROI 规则，必要时自动追踪止损（始终优先通过 update_stop_loss 来保护仓位）
 func (at *AutoTrader) applyDynamicProtection(pos map[string]interface{}) {
 	symbol, _ := pos["symbol"].(string)
 	side, _ := pos["side"].(string)
