@@ -810,7 +810,7 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, act
 	}
 }
 
-func ensureMidTermEntryFilters(data *market.Data, direction string) error {
+func ensureMidTermEntryFilters(data *market.Data, direction string, relax bool) error {
 	if data == nil || data.MidTermContext == nil {
 		return fmt.Errorf("缺少15m指标，无法验证%s条件", direction)
 	}
@@ -824,19 +824,25 @@ func ensureMidTermEntryFilters(data *market.Data, direction string) error {
 	switch direction {
 	case "long":
 		upper := mt.EMA20 + 0.6*mt.ATR14
-		if mt.RSI7 > 68 {
+		if mt.RSI7 > 68 && !relax {
 			return fmt.Errorf("15m RSI(7)=%.2f 超出68，提示词要求 wait", mt.RSI7)
 		}
-		if price > upper {
+		if price > upper && !relax {
 			return fmt.Errorf("价格 %.2f 高于 15m EMA20+0.6ATR(%.2f)，拒绝追多", price, upper)
+		}
+		if relax && mt.RSI7 > 75 {
+			return fmt.Errorf("15m RSI(7)=%.2f 已严重超买，即便单边行情也禁止追多", mt.RSI7)
 		}
 	case "short":
 		lower := mt.EMA20 - 0.6*mt.ATR14
-		if mt.RSI7 < 32 {
+		if mt.RSI7 < 32 && !relax {
 			return fmt.Errorf("15m RSI(7)=%.2f 低于32，提示词要求 wait", mt.RSI7)
 		}
-		if price < lower {
+		if price < lower && !relax {
 			return fmt.Errorf("价格 %.2f 低于 15m EMA20-0.6ATR(%.2f)，拒绝追空", price, lower)
+		}
+		if relax && mt.RSI7 < 25 {
+			return fmt.Errorf("15m RSI(7)=%.2f 已极度超卖，放宽策略仍不允许继续追空", mt.RSI7)
 		}
 	default:
 		return fmt.Errorf("未知方向: %s", direction)
@@ -846,7 +852,7 @@ func ensureMidTermEntryFilters(data *market.Data, direction string) error {
 }
 
 // ensureShortTermMomentum 要求 3m 指标确认方向（防追价/逆势）
-func ensureShortTermMomentum(data *market.Data, direction string) error {
+func ensureShortTermMomentum(data *market.Data, direction string, relax bool) error {
 	if data == nil {
 		return fmt.Errorf("缺少短周期指标，无法验证%s条件", direction)
 	}
@@ -854,12 +860,18 @@ func ensureShortTermMomentum(data *market.Data, direction string) error {
 	macd := data.CurrentMACD
 	switch direction {
 	case "long":
-		if macd < -floatEpsilon {
+		if macd < -floatEpsilon && !relax {
 			return fmt.Errorf("3m MACD=%.2f 仍为负值，短线动能未转多", macd)
 		}
+		if relax && macd < -0.5 {
+			return fmt.Errorf("3m MACD=%.2f 仍显著偏空，放宽策略也无法追多", macd)
+		}
 	case "short":
-		if macd > floatEpsilon {
+		if macd > floatEpsilon && !relax {
 			return fmt.Errorf("3m MACD=%.2f 仍为正值，短线动能未转空", macd)
+		}
+		if relax && macd > 0.5 {
+			return fmt.Errorf("3m MACD=%.2f 仍显著偏多，放宽策略也无法追空", macd)
 		}
 	default:
 		return fmt.Errorf("未知方向: %s", direction)
@@ -869,15 +881,60 @@ func ensureShortTermMomentum(data *market.Data, direction string) error {
 		last := series.RSI7Values[len(series.RSI7Values)-1]
 		prev := series.RSI7Values[len(series.RSI7Values)-2]
 		slope := last - prev
-		if direction == "long" && slope < -0.2 {
+		if direction == "long" && slope < -0.2 && !relax {
 			return fmt.Errorf("3m RSI 未出现回升确认 (%.2f→%.2f)", prev, last)
 		}
-		if direction == "short" && slope > 0.2 {
+		if direction == "short" && slope > 0.2 && !relax {
 			return fmt.Errorf("3m RSI 未出现回落确认 (%.2f→%.2f)", prev, last)
+		}
+		if relax {
+			if direction == "long" && slope < -0.5 {
+				return fmt.Errorf("3m RSI 仍急剧走低 (%.2f→%.2f)，即使放宽也无法确认反弹", prev, last)
+			}
+			if direction == "short" && slope > 0.5 {
+				return fmt.Errorf("3m RSI 快速回升 (%.2f→%.2f)，即使放宽也禁止继续追空", prev, last)
+			}
 		}
 	}
 
 	return nil
+}
+
+// shouldRelaxEntryFilters 结合 1h/4h 价格变化与 ATR 扩张度，判断是否允许放宽“不可追价”限制
+func (at *AutoTrader) shouldRelaxEntryFilters(data *market.Data, direction string) (bool, string) {
+	if data == nil || data.MidTermContext == nil || data.LongerTermContext == nil {
+		return false, ""
+	}
+
+	mt := data.MidTermContext
+	lt := data.LongerTermContext
+	if mt.ATR14 <= 0 || lt.ATR14 <= 0 {
+		return false, ""
+	}
+
+	atrRatio := 0.0
+	if lt.ATR14 > 0 {
+		atrRatio = lt.ATR3 / lt.ATR14
+	}
+	priceDistance := math.Abs(data.CurrentPrice-mt.EMA20) / mt.ATR14
+	oneHour := data.PriceChange1h
+	fourHour := data.PriceChange4h
+
+	switch strings.ToLower(direction) {
+	case "short":
+		strongDown := fourHour <= -0.5 && oneHour <= -0.4
+		if strongDown && atrRatio >= 1.05 && priceDistance >= 0.9 {
+			return true, fmt.Sprintf("4h%.2f%%/1h%.2f%% 共振下跌且 ATR 扩张%.2f", fourHour, oneHour, atrRatio)
+		}
+	case "long":
+		rebound := fourHour <= -0.4 && oneHour >= 0.6
+		trendingUp := fourHour >= 0.6 && oneHour >= 0.5
+		if (rebound || trendingUp) && atrRatio >= 1.05 && priceDistance >= 0.7 {
+			return true, fmt.Sprintf("1h 强劲拉升(%.2f%%) 配合 ATR 扩张%.2f", oneHour, atrRatio)
+		}
+	}
+
+	return false, ""
 }
 
 func isMajorPair(symbol string) bool {
@@ -902,6 +959,7 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 	if isMajorPair(decision.Symbol) {
 		minNotional = 60.0
 	}
+	at.ensureMinPositionNotional(decision, minNotional)
 
 	if maxNotional < minNotional {
 		return fmt.Errorf("可用余额仅支撑 %.2f USDT 名义价值，低于最小下单要求 %.2f USDT", maxNotional, minNotional)
@@ -918,7 +976,10 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 	}
 	distance := math.Abs(decision.StopLoss - marketData.CurrentPrice)
 	if distance > allowed {
-		return fmt.Errorf("初始止损距离 %.2f 超出允许 %.2f (≈1×ATR14 1h)，请重新计算止损或仓位", distance, allowed)
+		if !at.clampStopLossWithinATR(decision, marketData.CurrentPrice, allowed) {
+			return fmt.Errorf("初始止损距离 %.2f 超出允许 %.2f (≈1×ATR14 1h)，请重新计算止损或仓位", distance, allowed)
+		}
+		distance = math.Abs(decision.StopLoss - marketData.CurrentPrice)
 	}
 
 	isSmallAccount := totalEquity > floatEpsilon && totalEquity < 150
@@ -1011,6 +1072,47 @@ func allowedStopDistance(data *market.Data) (float64, error) {
 	return allowed, nil
 }
 
+func (at *AutoTrader) clampStopLossWithinATR(decision *decision.Decision, price, allowed float64) bool {
+	if price <= 0 || allowed <= 0 {
+		return false
+	}
+	distance := math.Abs(decision.StopLoss - price)
+	if distance <= allowed+floatEpsilon {
+		return true
+	}
+
+	buffer := allowed * 0.98
+	if buffer <= 0 {
+		buffer = allowed
+	}
+
+	isLong := decision.StopLoss < price
+	var newStop float64
+	if isLong {
+		newStop = price - buffer
+		if newStop <= 0 {
+			return false
+		}
+	} else {
+		newStop = price + buffer
+	}
+
+	log.Printf("  📏 调整 %s 初始止损距: %.2f → %.2f (允许 %.2f)", decision.Symbol, decision.StopLoss, newStop, allowed)
+	decision.StopLoss = newStop
+	return math.Abs(decision.StopLoss-price) <= allowed+floatEpsilon
+}
+
+func (at *AutoTrader) ensureMinPositionNotional(decision *decision.Decision, minNotional float64) {
+	if minNotional <= 0 {
+		return
+	}
+	if decision.PositionSizeUSD+floatEpsilon >= minNotional {
+		return
+	}
+	log.Printf("  ⬆️ 自动提升 %s 名义价值以满足最小下单: %.2f → %.2f USDT", decision.Symbol, decision.PositionSizeUSD, minNotional)
+	decision.PositionSizeUSD = minNotional
+}
+
 // executeOpenLongWithRecord 执行开多仓并记录详细信息
 func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📈 开多仓: %s", decision.Symbol)
@@ -1035,10 +1137,14 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	if err != nil {
 		return err
 	}
-	if err := ensureMidTermEntryFilters(marketData, "long"); err != nil {
+	relaxFilters, relaxReason := at.shouldRelaxEntryFilters(marketData, "long")
+	if relaxFilters && relaxReason != "" {
+		log.Printf("  ⚡ 启用顺势追涨模式: %s", relaxReason)
+	}
+	if err := ensureMidTermEntryFilters(marketData, "long", relaxFilters); err != nil {
 		return err
 	}
-	if err := ensureShortTermMomentum(marketData, "long"); err != nil {
+	if err := ensureShortTermMomentum(marketData, "long", relaxFilters); err != nil {
 		return err
 	}
 
@@ -1145,10 +1251,14 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	if err != nil {
 		return err
 	}
-	if err := ensureMidTermEntryFilters(marketData, "short"); err != nil {
+	relaxFilters, relaxReason := at.shouldRelaxEntryFilters(marketData, "short")
+	if relaxFilters && relaxReason != "" {
+		log.Printf("  ⚡ 启用顺势追空模式: %s", relaxReason)
+	}
+	if err := ensureMidTermEntryFilters(marketData, "short", relaxFilters); err != nil {
 		return err
 	}
-	if err := ensureShortTermMomentum(marketData, "short"); err != nil {
+	if err := ensureShortTermMomentum(marketData, "short", relaxFilters); err != nil {
 		return err
 	}
 
