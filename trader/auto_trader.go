@@ -10,9 +10,20 @@ import (
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
+	"os"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	// 当 AI 提供的 TP/SL 缺失或实际 R:R < 3 时的兜底比例
+	fallbackTakeProfitPct = 0.008 // 0.8%
+	fallbackStopLossPct   = 0.002 // 0.2%
+	// 监控与开关：通过环境变量快速启用/禁用
+	envRelaxEnabled        = "NOFX_RELAX_ENABLED"
+	envMinNotionalGuard    = "NOFX_MIN_NOTIONAL_GUARD_ENABLED"
+	exchangeMinNotionalU99 = 100.0 // 交易所最小名义值硬阈值，提供安全边际
 )
 
 // AutoTraderConfig 自动交易配置（简化版 - AI全权决策）
@@ -128,6 +139,14 @@ const (
 	minConfidence = 80   // 执行层硬性要求的最低置信度
 	floatEpsilon  = 1e-6 // 浮点比较容差
 )
+
+func envBool(env string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(env)))
+	if v == "" {
+		return def
+	}
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
 
 type positionMeta struct {
 	Side       string  // 持仓方向（long / short）
@@ -563,6 +582,14 @@ func (at *AutoTrader) runCycle() error {
 	//           d.Leverage, d.PositionSizeUSD, d.StopLoss, d.TakeProfit)
 	//     }
 	// }
+	// 7. 基于现价补齐/矫正 TP/SL（缺失或 R:R<3 时回退 0.8%/0.2%）
+	at.applyFallbackTPAndSL(decision.Decisions)
+
+	// 更新记录的决策快照（包含兜底后的 TP/SL）
+	if marshaled, err := json.MarshalIndent(decision.Decisions, "", "  "); err == nil {
+		record.DecisionJSON = string(marshaled)
+	}
+
 	log.Println()
 	log.Print(strings.Repeat("-", 70))
 	// 8. 自动补充动态止盈指令（若AI未覆盖且浮盈达到阈值）
@@ -906,6 +933,10 @@ func (at *AutoTrader) shouldRelaxEntryFilters(data *market.Data, direction strin
 		return false, ""
 	}
 
+	if !envBool(envRelaxEnabled, true) {
+		return false, ""
+	}
+
 	mt := data.MidTermContext
 	lt := data.LongerTermContext
 	if mt.ATR14 <= 0 || lt.ATR14 <= 0 {
@@ -922,14 +953,14 @@ func (at *AutoTrader) shouldRelaxEntryFilters(data *market.Data, direction strin
 
 	switch strings.ToLower(direction) {
 	case "short":
-		strongDown := fourHour <= -0.5 && oneHour <= -0.4
-		if strongDown && atrRatio >= 1.05 && priceDistance >= 0.9 {
+		strongDown := fourHour <= -0.4 && oneHour <= -0.3
+		if strongDown && atrRatio >= 0.95 && priceDistance >= 0.6 {
 			return true, fmt.Sprintf("4h%.2f%%/1h%.2f%% 共振下跌且 ATR 扩张%.2f", fourHour, oneHour, atrRatio)
 		}
 	case "long":
-		rebound := fourHour <= -0.4 && oneHour >= 0.6
-		trendingUp := fourHour >= 0.6 && oneHour >= 0.5
-		if (rebound || trendingUp) && atrRatio >= 1.05 && priceDistance >= 0.7 {
+		rebound := fourHour <= -0.3 && oneHour >= 0.5
+		trendingUp := fourHour >= 0.5 && oneHour >= 0.4
+		if (rebound || trendingUp) && atrRatio >= 0.95 && priceDistance >= 0.5 {
 			return true, fmt.Sprintf("1h 强劲拉升(%.2f%%) 配合 ATR 扩张%.2f", oneHour, atrRatio)
 		}
 	}
@@ -940,6 +971,56 @@ func (at *AutoTrader) shouldRelaxEntryFilters(data *market.Data, direction strin
 func isMajorPair(symbol string) bool {
 	s := strings.ToUpper(symbol)
 	return s == "BTCUSDT" || s == "ETHUSDT"
+}
+
+// applyFallbackTPAndSL 在 TP/SL 缺失或基于现价的实际 R:R < 3 时，回退为固定 0.8% / 0.2% 的止盈止损
+func (at *AutoTrader) applyFallbackTPAndSL(decisions []decision.Decision) {
+	for i := range decisions {
+		d := &decisions[i]
+		if d.Action != "open_long" && d.Action != "open_short" {
+			continue
+		}
+
+		marketData, err := market.Get(d.Symbol)
+		if err != nil || marketData == nil || marketData.CurrentPrice <= 0 {
+			log.Printf("⚠️ 获取 %s 行情失败，跳过 TP/SL 兜底: %v", d.Symbol, err)
+			continue
+		}
+		currentPrice := marketData.CurrentPrice
+
+		needFallback := false
+		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
+			needFallback = true
+		} else {
+			var risk, reward float64
+			if d.Action == "open_long" {
+				risk = currentPrice - d.StopLoss
+				reward = d.TakeProfit - currentPrice
+			} else {
+				risk = d.StopLoss - currentPrice
+				reward = currentPrice - d.TakeProfit
+			}
+			if risk <= 0 || reward <= 0 || reward/risk < 3.0 {
+				needFallback = true
+			}
+		}
+
+		if !needFallback {
+			continue
+		}
+
+		if d.Action == "open_long" {
+			d.StopLoss = currentPrice * (1 - fallbackStopLossPct)
+			d.TakeProfit = currentPrice * (1 + fallbackTakeProfitPct)
+		} else {
+			d.StopLoss = currentPrice * (1 + fallbackStopLossPct)
+			d.TakeProfit = currentPrice * (1 - fallbackTakeProfitPct)
+		}
+
+		d.Reasoning = strings.TrimSpace(fmt.Sprintf(
+			"%s | [fallback] TP/SL 回退为 %.2f%% / %.2f%% (现价 %.4f) — 原始参数缺失或实际 R:R < 3",
+			d.Reasoning, fallbackTakeProfitPct*100, fallbackStopLossPct*100, currentPrice))
+	}
 }
 
 func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, availableBalance, totalEquity float64, marketData *market.Data) error {
@@ -958,6 +1039,9 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 	minNotional := 12.0
 	if isMajorPair(decision.Symbol) {
 		minNotional = 60.0
+	}
+	if envBool(envMinNotionalGuard, true) {
+		minNotional = math.Max(minNotional, exchangeMinNotionalU99*1.1) // 给 10% 缓冲，避免浮点/精度导致再次触发 notional 错误
 	}
 	at.ensureMinPositionNotional(decision, minNotional)
 
@@ -1018,6 +1102,11 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 		if decision.RiskUSD > 0 {
 			decision.RiskUSD *= ratio
 		}
+	}
+
+	// 最终防呆：软/硬上限可能把仓位压到最小名义以下，此时宁可报错也不送到交易所
+	if envBool(envMinNotionalGuard, true) && decision.PositionSizeUSD+floatEpsilon < minNotional {
+		return fmt.Errorf("名义价值 %.2f USDT 低于最小下单要求 %.2f USDT，放弃下单以避免交易所拒单", decision.PositionSizeUSD, minNotional)
 	}
 
 	if decision.RiskUSD > 0 && decision.RiskUSD > maxRisk {
