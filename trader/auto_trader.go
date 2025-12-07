@@ -19,7 +19,8 @@ import (
 const (
 	// 当 AI 提供的 TP/SL 缺失或实际 R:R < 3 时的兜底比例
 	fallbackTakeProfitPct = 0.008 // 0.8%
-	fallbackStopLossPct   = 0.002 // 0.2%
+	// 兜底止损比例，结合 ATR 下限，避免“噪音级”止损
+	fallbackStopLossPct = 0.005 // 0.5%
 	// 监控与开关：通过环境变量快速启用/禁用
 	envRelaxEnabled        = "NOFX_RELAX_ENABLED"
 	envMinNotionalGuard    = "NOFX_MIN_NOTIONAL_GUARD_ENABLED"
@@ -1009,6 +1010,12 @@ func (at *AutoTrader) applyFallbackTPAndSL(decisions []decision.Decision) {
 			continue
 		}
 
+		// 计算 ATR 下限，避免兜底止损小于噪音
+		minStopDistance := 0.0
+		if marketData.MidTermContext != nil && marketData.MidTermContext.ATR14 > 0 {
+			minStopDistance = 0.5 * marketData.MidTermContext.ATR14
+		}
+
 		if d.Action == "open_long" {
 			d.StopLoss = currentPrice * (1 - fallbackStopLossPct)
 			d.TakeProfit = currentPrice * (1 + fallbackTakeProfitPct)
@@ -1017,8 +1024,17 @@ func (at *AutoTrader) applyFallbackTPAndSL(decisions []decision.Decision) {
 			d.TakeProfit = currentPrice * (1 - fallbackTakeProfitPct)
 		}
 
+		// 若 ATR 下限大于百分比止损，则用 ATR 下限替代
+		if minStopDistance > 0 {
+			if d.Action == "open_long" {
+				d.StopLoss = math.Min(d.StopLoss, currentPrice-minStopDistance)
+			} else {
+				d.StopLoss = math.Max(d.StopLoss, currentPrice+minStopDistance)
+			}
+		}
+
 		d.Reasoning = strings.TrimSpace(fmt.Sprintf(
-			"%s | [fallback] TP/SL 回退为 %.2f%% / %.2f%% (现价 %.4f) — 原始参数缺失或实际 R:R < 3",
+			"%s | [fallback] TP/SL 回退为 %.2f%% / %.2f%% (现价 %.4f)，SL≥0.5×ATR14(1h) — 原始参数缺失或实际 R:R < 3",
 			d.Reasoning, fallbackTakeProfitPct*100, fallbackStopLossPct*100, currentPrice))
 	}
 }
@@ -1066,20 +1082,7 @@ func (at *AutoTrader) ensurePositionFitsBalance(decision *decision.Decision, ava
 		distance = math.Abs(decision.StopLoss - marketData.CurrentPrice)
 	}
 
-	isSmallAccount := totalEquity > floatEpsilon && totalEquity < 150
-
-	// 小账户模式：净值低于 150U 时收紧所有关键约束，防止 AI 过度下单
-	if isSmallAccount {
-		maxNotionalByEquity := totalEquity
-		if decision.PositionSizeUSD > maxNotionalByEquity {
-			ratio := maxNotionalByEquity / decision.PositionSizeUSD
-			log.Printf("  🛡 小账户模式限制 %s 仓位: %.2f → %.2f USDT (净值%.2f)", decision.Symbol, decision.PositionSizeUSD, maxNotionalByEquity, totalEquity)
-			decision.PositionSizeUSD = maxNotionalByEquity
-			if decision.RiskUSD > 0 {
-				decision.RiskUSD *= ratio
-			}
-		}
-	} else if totalEquity > floatEpsilon {
+	if totalEquity > floatEpsilon {
 		softMultiplier := 1.5
 		if isMajorPair(decision.Symbol) {
 			softMultiplier = 3.0
